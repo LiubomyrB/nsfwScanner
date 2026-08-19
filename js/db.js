@@ -1,3 +1,4 @@
+// @ts-nocheck — plain multi-file classic-script app; globals (VMDB/VMScanner/VMTranscoder/tf/nsfwjs) are wired via <script> load order, not modules.
 // IndexedDB wrapper for the Video Moderator app.
 // Stores:
 //  - "videos"   keyPath "fileName": { fileName, fileSize, lastModified, duration,

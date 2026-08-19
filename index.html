@@ -43,6 +43,17 @@
   <button id="cancelScanBtn" class="link-btn">cancel</button>
 </div>
 
+<!-- FFmpeg transcode progress screen -->
+<div id="transcodeScreen" class="center-screen hidden">
+  <h2>Converting video for playback…</h2>
+  <div class="progress-outer">
+    <div id="transcodeProgressBar" class="progress-inner" style="width:0%"></div>
+  </div>
+  <p id="transcodeProgressText">0%</p>
+  <p id="transcodeStatusText" class="dim">Starting FFmpeg…</p>
+  <button id="cancelTranscodeBtn" class="link-btn">cancel</button>
+</div>
+
 <!-- Player screen -->
 <div id="playerScreen" class="center-screen hidden">
   <div id="videoWrap" class="video-wrap">
@@ -66,6 +77,21 @@
   </div>
 </div>
 
+<!-- "Unsupported format, offer to transcode" warning dialog -->
+<div id="transcodeWarningOverlay" class="dialog-overlay hidden">
+  <div class="dialog" role="dialog" aria-modal="true">
+    <h3>Format not supported for playback</h3>
+    <p>Your browser can't play <span id="transcodeFileName"></span> directly (unsupported
+      container/codec). It can be converted to MP4 (H.264/AAC) locally in your browser using
+      FFmpeg before scanning and playback. This runs entirely on your device — nothing is
+      uploaded anywhere — but it can take a while for large files.</p>
+    <div class="dialog-actions">
+      <button id="transcodeConfirmBtn" class="btn primary">Convert with FFmpeg</button>
+      <button id="transcodeCancelBtn" class="btn">Cancel</button>
+    </div>
+  </div>
+</div>
+
 <!-- Settings dialog -->
 <div id="settingsDialogOverlay" class="dialog-overlay hidden">
   <div class="dialog" role="dialog" aria-modal="true">
@@ -82,6 +108,25 @@
       <input type="number" id="blurAdvanceInput" min="0" step="0.1">
       <span class="hint">Start blurring this many seconds before a flagged scene begins.</span>
     </label>
+
+    <label class="field">
+      <span>Scan interval (seconds)</span>
+      <input type="number" id="scanIntervalInput" min="0.1" step="0.1">
+      <span class="hint">Gap between sampled frames while scanning. Smaller = more accurate
+        scene start/end times, but a slower scan. Applies to scans started after this is
+        changed — rescan a video to apply it retroactively.</span>
+    </label>
+
+    <label class="field checkbox-field">
+      <input type="checkbox" id="adaptiveScanInput">
+      <span>Adaptive two-pass scan (faster)</span>
+    </label>
+    <p class="hint" style="margin-top:-10px;">Scans a fast coarse pass first, then re-scans
+      at the full "scan interval" precision only around anything it finds. Much faster on
+      long videos, since most of a video is usually clean. A scene shorter than the coarse
+      pass's gap (a few seconds) that falls entirely between two clean samples can still be
+      missed — turn this off for maximum thoroughness on content you don't trust a coarse
+      pass with. Changing this — like scan interval — only affects scans started afterward.</p>
 
     <label class="field checkbox-field">
       <input type="checkbox" id="rememberStateInput">
@@ -101,6 +146,7 @@
 <script src="https://cdn.jsdelivr.net/npm/nsfwjs@4.4.0/dist/browser/nsfwjs.min.js"></script>
 <script src="js/db.js"></script>
 <script src="js/scanner.js"></script>
+<script src="js/transcoder.js"></script>
 <script src="js/app.js"></script>
 </body>
 </html>

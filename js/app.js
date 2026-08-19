@@ -1,12 +1,16 @@
+// @ts-nocheck — plain multi-file classic-script app; globals (VMDB/VMScanner/VMTranscoder/tf/nsfwjs) are wired via <script> load order, not modules.
 (function () {
-  const DEFAULT_SETTINGS = { sensitivity: 0.6, blurAdvance: 1.5, rememberState: true };
+  const DEFAULT_SETTINGS = { sensitivity: 0.6, blurAdvance: 1.5, rememberState: true, scanInterval: 1, adaptiveScan: true };
 
+  /** @type {Record<string, any>} */
   const els = {};
   let settings = Object.assign({}, DEFAULT_SETTINGS);
   let activeVideo = null; // { fileName, file, handle, samples, interval, duration, segments }
   let currentObjectUrl = null;
   let cancelToken = null;
+  let transcodeCancelToken = null;
   let pendingExisting = null;
+  let pendingTranscodeResolve = null;
   let lastPersistAt = 0;
 
   document.addEventListener("DOMContentLoaded", init);
@@ -28,11 +32,13 @@
       "settingsBtn", "openFileBtn",
       "startScreen", "pickFileBtn", "resumeBox", "resumeText", "resumeBtn", "resumeDismissBtn",
       "scanScreen", "scanProgressBar", "scanProgressText", "scanStatusText", "cancelScanBtn",
+      "transcodeScreen", "transcodeProgressBar", "transcodeProgressText", "transcodeStatusText", "cancelTranscodeBtn",
       "playerScreen", "video", "blurBadge", "fileNameLabel",
       "fileInput",
       "existingDialogOverlay", "existingFileName", "useExistingBtn", "rescanBtn",
+      "transcodeWarningOverlay", "transcodeFileName", "transcodeConfirmBtn", "transcodeCancelBtn",
       "settingsDialogOverlay", "sensitivityInput", "sensitivityValue", "blurAdvanceInput",
-      "rememberStateInput", "closeSettingsBtn",
+      "scanIntervalInput", "adaptiveScanInput", "rememberStateInput", "closeSettingsBtn",
     ].forEach((id) => { els[id] = document.getElementById(id); });
   }
 
@@ -53,6 +59,8 @@
 
     els.sensitivityInput.addEventListener("input", onSensitivityChange);
     els.blurAdvanceInput.addEventListener("change", onBlurAdvanceChange);
+    els.scanIntervalInput.addEventListener("change", onScanIntervalChange);
+    els.adaptiveScanInput.addEventListener("change", onAdaptiveScanChange);
     els.rememberStateInput.addEventListener("change", onRememberStateChange);
 
     els.useExistingBtn.addEventListener("click", async () => {
@@ -68,6 +76,18 @@
 
     els.cancelScanBtn.addEventListener("click", () => {
       if (cancelToken) cancelToken.cancel();
+    });
+    els.cancelTranscodeBtn.addEventListener("click", () => {
+      if (transcodeCancelToken) transcodeCancelToken.cancel();
+    });
+
+    els.transcodeConfirmBtn.addEventListener("click", () => {
+      hideTranscodeWarningDialog();
+      resolveTranscodeDecision(true);
+    });
+    els.transcodeCancelBtn.addEventListener("click", () => {
+      hideTranscodeWarningDialog();
+      resolveTranscodeDecision(false);
     });
 
     els.video.addEventListener("timeupdate", onVideoTimeUpdate);
@@ -94,6 +114,8 @@
     els.sensitivityInput.value = settings.sensitivity;
     els.sensitivityValue.textContent = settings.sensitivity.toFixed(2);
     els.blurAdvanceInput.value = settings.blurAdvance;
+    els.scanIntervalInput.value = settings.scanInterval;
+    els.adaptiveScanInput.checked = !!settings.adaptiveScan;
     els.rememberStateInput.checked = !!settings.rememberState;
   }
 
@@ -117,6 +139,18 @@
     const v = parseFloat(e.target.value);
     settings.blurAdvance = isFinite(v) && v >= 0 ? v : 0;
     els.blurAdvanceInput.value = settings.blurAdvance;
+    persistSettings();
+  }
+
+  function onScanIntervalChange(e) {
+    const v = parseFloat(e.target.value);
+    settings.scanInterval = isFinite(v) && v >= 0.1 ? v : DEFAULT_SETTINGS.scanInterval;
+    els.scanIntervalInput.value = settings.scanInterval;
+    persistSettings();
+  }
+
+  function onAdaptiveScanChange(e) {
+    settings.adaptiveScan = !!e.target.checked;
     persistSettings();
   }
 
@@ -158,16 +192,86 @@
 
   async function openFileFlow(file, handle) {
     if (!file) return;
-    const existing = await VMDB.get("videos", file.name);
+    const originalName = file.name;
+
+    const playableFile = await ensurePlayableFile(file);
+    if (!playableFile) {
+      showStartScreen();
+      return;
+    }
+
+    const existing = await VMDB.get("videos", originalName);
     if (existing && existing.samples && existing.samples.length) {
       showExistingDialog(
-        file.name,
-        () => usePreScanned(file, handle, existing, 0, true),
-        () => startScan(file, handle)
+        originalName,
+        () => usePreScanned(playableFile, handle, existing, 0, true),
+        () => startScan(playableFile, handle, originalName)
       );
     } else {
-      await startScan(file, handle);
+      await startScan(playableFile, handle, originalName);
     }
+  }
+
+  // ---------- format compatibility / ffmpeg transcode ----------
+
+  // Returns a File the <video> element can actually play: either the original
+  // file (if the browser can decode it), a freshly-transcoded MP4, or null if
+  // the browser can't play it and the user declined to convert it.
+  async function ensurePlayableFile(file) {
+    let playable = false;
+    try {
+      playable = await VMTranscoder.canBrowserPlay(file);
+    } catch (e) {
+      console.warn("Playability check failed, assuming not playable.", e);
+    }
+    if (playable) return file;
+
+    const confirmed = await showTranscodeWarningDialog(file.name);
+    if (!confirmed) return null;
+
+    return runTranscode(file);
+  }
+
+  function showTranscodeWarningDialog(fileName) {
+    els.transcodeFileName.textContent = fileName;
+    els.transcodeWarningOverlay.classList.remove("hidden");
+    return new Promise((resolve) => {
+      pendingTranscodeResolve = resolve;
+    });
+  }
+
+  function hideTranscodeWarningDialog() {
+    els.transcodeWarningOverlay.classList.add("hidden");
+  }
+
+  function resolveTranscodeDecision(confirmed) {
+    const resolve = pendingTranscodeResolve;
+    pendingTranscodeResolve = null;
+    if (resolve) resolve(confirmed);
+  }
+
+  async function runTranscode(file) {
+    showTranscodeScreen();
+    transcodeCancelToken = VMTranscoder.createCancelToken();
+    try {
+      const outFile = await VMTranscoder.transcodeToMp4(file, {
+        onProgress: updateTranscodeProgress,
+        onStatus: (msg) => { els.transcodeStatusText.textContent = msg; },
+        token: transcodeCancelToken,
+      });
+      return outFile;
+    } catch (e) {
+      if (e && e.cancelled) return null;
+      console.error(e);
+      alert("Video conversion failed: " + (e && e.message ? e.message : e));
+      return null;
+    }
+  }
+
+  function updateTranscodeProgress(pct) {
+    const p = Math.round(pct);
+    els.transcodeProgressBar.style.width = p + "%";
+    els.transcodeProgressText.textContent = p + "%";
   }
 
   function showExistingDialog(fileName, onUseExisting, onRescan) {
@@ -188,7 +292,8 @@
 
   // ---------- scanning ----------
 
-  async function startScan(file, handle) {
+  async function startScan(file, handle, originalName) {
+    const keyName = originalName || file.name;
     showScanScreen();
     cancelToken = VMScanner.createCancelToken();
     try {
@@ -196,14 +301,17 @@
         onProgress: updateScanProgress,
         onStatus: (msg) => { els.scanStatusText.textContent = msg; },
         token: cancelToken,
+        sampleInterval: settings.scanInterval,
+        adaptive: settings.adaptiveScan,
+        sensitivity: settings.sensitivity,
       });
 
       const segments = VMScanner.mergeSegments(samples, settings.sensitivity, interval);
-      const txt = VMScanner.segmentsToTxt(segments, file.name);
-      downloadTxt(txt, baseName(file.name) + "_timecodes.txt");
+      const txt = VMScanner.segmentsToTxt(segments, keyName);
+      downloadTxt(txt, baseName(keyName) + "_timecodes.txt");
 
       const record = {
-        fileName: file.name,
+        fileName: keyName,
         fileSize: file.size,
         lastModified: file.lastModified,
         duration,
@@ -217,9 +325,10 @@
         updatedAt: Date.now(),
       };
       if (handle) record.fileHandle = handle;
+      if (file.name !== keyName) record.transcoded = true;
 
       await VMDB.put("videos", record);
-      await VMDB.put("meta", { id: "app", lastOpenedFileName: file.name });
+      await VMDB.put("meta", { id: "app", lastOpenedFileName: keyName });
 
       await loadPlayerWithData(file, handle, record, 0, true);
     } catch (e) {
@@ -255,7 +364,7 @@
     if (currentObjectUrl) URL.revokeObjectURL(currentObjectUrl);
     currentObjectUrl = URL.createObjectURL(file);
 
-    els.fileNameLabel.textContent = record.fileName;
+    els.fileNameLabel.textContent = record.fileName + (record.transcoded ? " (converted for playback)" : "");
     els.video.src = currentObjectUrl;
     setBlur(false);
     showPlayerScreen();
@@ -324,14 +433,24 @@
       if (perm === "granted") {
         try {
           const file = await record.fileHandle.getFile();
-          await loadPlayerWithData(file, record.fileHandle, record, record.lastCurrentTime, record.lastPaused);
-          return;
+          const resumed = await resumeWithFile(file, record.fileHandle, record);
+          if (resumed) return;
         } catch (e) {
           console.warn("Could not silently reopen last file, showing resume banner instead.", e);
         }
       }
     }
     showResumeBanner(record);
+  }
+
+  // Runs a re-obtained "last opened" file through the same playability/transcode
+  // gate as a fresh pick, then loads the player at the remembered position.
+  // Returns true if the player was shown, false if the user backed out.
+  async function resumeWithFile(file, handle, record) {
+    const playableFile = await ensurePlayableFile(file);
+    if (!playableFile) return false;
+    await loadPlayerWithData(playableFile, handle, record, record.lastCurrentTime, record.lastPaused);
+    return true;
   }
 
   function showResumeBanner(record) {
@@ -344,7 +463,9 @@
           const perm = await record.fileHandle.requestPermission({ mode: "read" });
           if (perm === "granted") {
             const file = await record.fileHandle.getFile();
-            await loadPlayerWithData(file, record.fileHandle, record, record.lastCurrentTime, record.lastPaused);
+            const resumed = await resumeWithFile(file, record.fileHandle, record);
+            if (resumed) return;
+            showStartScreen();
             return;
           }
         } catch (e) {
@@ -355,7 +476,8 @@
       const picked = await pickVideoFile();
       if (!picked) return;
       if (picked.file.name === record.fileName) {
-        await loadPlayerWithData(picked.file, picked.handle, record, record.lastCurrentTime, record.lastPaused);
+        const resumed = await resumeWithFile(picked.file, picked.handle, record);
+        if (!resumed) showStartScreen();
       } else {
         await openFileFlow(picked.file, picked.handle);
       }
@@ -371,21 +493,34 @@
   function showStartScreen() {
     els.startScreen.classList.remove("hidden");
     els.scanScreen.classList.add("hidden");
+    els.transcodeScreen.classList.add("hidden");
     els.playerScreen.classList.add("hidden");
   }
 
   function showScanScreen() {
     els.startScreen.classList.add("hidden");
     els.scanScreen.classList.remove("hidden");
+    els.transcodeScreen.classList.add("hidden");
     els.playerScreen.classList.add("hidden");
     els.scanProgressBar.style.width = "0%";
     els.scanProgressText.textContent = "0%";
     els.scanStatusText.textContent = "Loading model…";
   }
 
+  function showTranscodeScreen() {
+    els.startScreen.classList.add("hidden");
+    els.scanScreen.classList.add("hidden");
+    els.transcodeScreen.classList.remove("hidden");
+    els.playerScreen.classList.add("hidden");
+    els.transcodeProgressBar.style.width = "0%";
+    els.transcodeProgressText.textContent = "0%";
+    els.transcodeStatusText.textContent = "Starting FFmpeg…";
+  }
+
   function showPlayerScreen() {
     els.startScreen.classList.add("hidden");
     els.scanScreen.classList.add("hidden");
+    els.transcodeScreen.classList.add("hidden");
     els.playerScreen.classList.remove("hidden");
     els.resumeBox.classList.add("hidden");
     els.openFileBtn.classList.remove("hidden");

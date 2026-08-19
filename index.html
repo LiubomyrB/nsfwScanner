@@ -1,0 +1,106 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Video Moderator — nudity scanner &amp; auto-blur player</title>
+<link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+
+<!-- Top-left toolbar: always has Settings; "Open file" appears once a video has been used -->
+<div id="toolbar" class="toolbar">
+  <button id="settingsBtn" class="icon-btn" title="Settings" aria-label="Settings">
+    <svg viewBox="0 0 24 24" width="22" height="22"><path fill="currentColor" d="M19.14 12.94a7.14 7.14 0 0 0 .06-.94 7.14 7.14 0 0 0-.06-.94l2.03-1.58a.5.5 0 0 0 .12-.64l-1.92-3.32a.5.5 0 0 0-.6-.22l-2.39.96a7.3 7.3 0 0 0-1.62-.94L14.4 2.7a.5.5 0 0 0-.5-.42h-3.84a.5.5 0 0 0-.5.42l-.36 2.56c-.59.24-1.13.56-1.62.94l-2.39-.96a.5.5 0 0 0-.6.22L2.67 8.84a.5.5 0 0 0 .12.64l2.03 1.58c-.04.31-.06.62-.06.94s.02.63.06.94l-2.03 1.58a.5.5 0 0 0-.12.64l1.92 3.32c.14.24.42.32.6.22l2.39-.96c.49.38 1.03.7 1.62.94l.36 2.56c.05.24.25.42.5.42h3.84c.25 0 .45-.18.5-.42l.36-2.56c.59-.24 1.13-.56 1.62-.94l2.39.96c.24.1.5 0 .6-.22l1.92-3.32a.5.5 0 0 0-.12-.64Zm-7.14 2.44a3.38 3.38 0 1 1 0-6.76 3.38 3.38 0 0 1 0 6.76Z"/></svg>
+    <span>Settings</span>
+  </button>
+  <button id="openFileBtn" class="icon-btn hidden" title="Open another video file" aria-label="Open file">
+    <svg viewBox="0 0 24 24" width="20" height="20"><path fill="currentColor" d="M20 6h-8l-2-2H4a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2Z"/></svg>
+    <span>Open file</span>
+  </button>
+</div>
+
+<!-- Initial / resume screen -->
+<div id="startScreen" class="center-screen">
+  <button id="pickFileBtn" class="big-btn">🎬 Open Video File</button>
+  <div id="resumeBox" class="resume-box hidden">
+    <p id="resumeText"></p>
+    <div class="resume-actions">
+      <button id="resumeBtn" class="big-btn small">▶ Resume last video</button>
+      <button id="resumeDismissBtn" class="link-btn">start over instead</button>
+    </div>
+  </div>
+</div>
+
+<!-- Scanning progress screen -->
+<div id="scanScreen" class="center-screen hidden">
+  <h2>Scanning video for nudity…</h2>
+  <div class="progress-outer">
+    <div id="scanProgressBar" class="progress-inner" style="width:0%"></div>
+  </div>
+  <p id="scanProgressText">0%</p>
+  <p id="scanStatusText" class="dim">Loading model…</p>
+  <button id="cancelScanBtn" class="link-btn">cancel</button>
+</div>
+
+<!-- Player screen -->
+<div id="playerScreen" class="center-screen hidden">
+  <div id="videoWrap" class="video-wrap">
+    <video id="video" playsinline></video>
+    <div id="blurBadge" class="blur-badge hidden">🔒 blurred</div>
+  </div>
+  <div id="fileNameLabel" class="file-name-label"></div>
+</div>
+
+<input type="file" id="fileInput" accept="video/*" class="hidden">
+
+<!-- "Existing timecodes found" dialog -->
+<div id="existingDialogOverlay" class="dialog-overlay hidden">
+  <div class="dialog" role="dialog" aria-modal="true">
+    <h3>Existing scan found</h3>
+    <p>This video (<span id="existingFileName"></span>) was already scanned before.</p>
+    <div class="dialog-actions">
+      <button id="useExistingBtn" class="btn primary">Use existing timecodes</button>
+      <button id="rescanBtn" class="btn">Rescan video</button>
+    </div>
+  </div>
+</div>
+
+<!-- Settings dialog -->
+<div id="settingsDialogOverlay" class="dialog-overlay hidden">
+  <div class="dialog" role="dialog" aria-modal="true">
+    <h3>Settings</h3>
+
+    <label class="field">
+      <span>Sensitivity <b id="sensitivityValue"></b></span>
+      <input type="range" id="sensitivityInput" min="0" max="1" step="0.01">
+      <span class="hint">Blur triggers only when detected probability is ≥ this value.</span>
+    </label>
+
+    <label class="field">
+      <span>Blur in advance (seconds)</span>
+      <input type="number" id="blurAdvanceInput" min="0" step="0.1">
+      <span class="hint">Start blurring this many seconds before a flagged scene begins.</span>
+    </label>
+
+    <label class="field checkbox-field">
+      <input type="checkbox" id="rememberStateInput">
+      <span>Remember state after reload</span>
+    </label>
+
+    <div class="dialog-actions">
+      <button id="closeSettingsBtn" class="btn primary">Close</button>
+    </div>
+  </div>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.20.0/dist/tf.min.js"></script>
+<!-- NSFWJS browser bundle + the MobileNetV2 model files it expects to find as globals (window.model / window.group1_shard1of1) -->
+<script src="https://cdn.jsdelivr.net/npm/nsfwjs@4.4.0/dist/models/mobilenet_v2/model.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/nsfwjs@4.4.0/dist/models/mobilenet_v2/group1-shard1of1.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/nsfwjs@4.4.0/dist/browser/nsfwjs.min.js"></script>
+<script src="js/db.js"></script>
+<script src="js/scanner.js"></script>
+<script src="js/app.js"></script>
+</body>
+</html>

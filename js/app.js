@@ -1,6 +1,13 @@
 // @ts-nocheck — plain multi-file classic-script app; globals (VMDB/VMScanner/VMTranscoder/tf/nsfwjs) are wired via <script> load order, not modules.
 (function () {
-  const DEFAULT_SETTINGS = { sensitivity: 0.6, blurAdvance: 1.5, rememberState: true, scanInterval: 1, adaptiveScan: true };
+  const DEFAULT_SETTINGS = {
+    sensitivity: 0.6,
+    blurAdvance: 1.5,
+    rememberState: true,
+    scanInterval: 1,
+    adaptiveScan: true,
+    nudeNetConfirm: true,
+  };
 
   /** @type {Record<string, any>} */
   const els = {};
@@ -38,7 +45,7 @@
       "existingDialogOverlay", "existingFileName", "useExistingBtn", "rescanBtn",
       "transcodeWarningOverlay", "transcodeFileName", "transcodeConfirmBtn", "transcodeCancelBtn",
       "settingsDialogOverlay", "sensitivityInput", "sensitivityValue", "blurAdvanceInput",
-      "scanIntervalInput", "adaptiveScanInput", "rememberStateInput", "closeSettingsBtn",
+      "scanIntervalInput", "adaptiveScanInput", "nudeNetConfirmInput", "rememberStateInput", "closeSettingsBtn",
     ].forEach((id) => { els[id] = document.getElementById(id); });
   }
 
@@ -61,6 +68,7 @@
     els.blurAdvanceInput.addEventListener("change", onBlurAdvanceChange);
     els.scanIntervalInput.addEventListener("change", onScanIntervalChange);
     els.adaptiveScanInput.addEventListener("change", onAdaptiveScanChange);
+    els.nudeNetConfirmInput.addEventListener("change", onNudeNetConfirmChange);
     els.rememberStateInput.addEventListener("change", onRememberStateChange);
 
     els.useExistingBtn.addEventListener("click", async () => {
@@ -116,6 +124,7 @@
     els.blurAdvanceInput.value = settings.blurAdvance;
     els.scanIntervalInput.value = settings.scanInterval;
     els.adaptiveScanInput.checked = !!settings.adaptiveScan;
+    els.nudeNetConfirmInput.checked = !!settings.nudeNetConfirm;
     els.rememberStateInput.checked = !!settings.rememberState;
   }
 
@@ -151,6 +160,11 @@
 
   function onAdaptiveScanChange(e) {
     settings.adaptiveScan = !!e.target.checked;
+    persistSettings();
+  }
+
+  function onNudeNetConfirmChange(e) {
+    settings.nudeNetConfirm = !!e.target.checked;
     persistSettings();
   }
 
@@ -304,6 +318,7 @@
         sampleInterval: settings.scanInterval,
         adaptive: settings.adaptiveScan,
         sensitivity: settings.sensitivity,
+        nudeNetConfirm: settings.nudeNetConfirm,
       });
 
       const segments = VMScanner.mergeSegments(samples, settings.sensitivity, interval);

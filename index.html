@@ -129,6 +129,18 @@
       pass with. Changing this — like scan interval — only affects scans started afterward.</p>
 
     <label class="field checkbox-field">
+      <input type="checkbox" id="nudeNetConfirmInput">
+      <span>Confirm with body-part detector (NudeNet)</span>
+    </label>
+    <p class="hint" style="margin-top:-10px;">NSFWJS alone sometimes flags frames with a lot
+      of visible skin but no actual nudity (bare neck/shoulders/midriff, etc). When on,
+      anything NSFWJS flags gets double-checked against a real body-part detector, and only
+      counts if it specifically finds exposed breast, genitals, or anus — not just skin in
+      general. Downloads an extra ~70MB model the first time it's needed, and is slower
+      per-frame than NSFWJS, but only runs on the minority of frames NSFWJS already
+      flagged, so it shouldn't noticeably slow down otherwise-clean footage.</p>
+
+    <label class="field checkbox-field">
       <input type="checkbox" id="rememberStateInput">
       <span>Remember state after reload</span>
     </label>

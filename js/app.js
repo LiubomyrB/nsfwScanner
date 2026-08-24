@@ -6,7 +6,14 @@
     rememberState: true,
     scanInterval: 1,
     adaptiveScan: true,
-    nudeNetConfirm: true,
+    // "nsfwjs": NSFWJS only. "confirm": NSFWJS scans, NudeNet double-checks what it flags.
+    // "nudenet": NudeNet is the primary/only classifier for every sampled frame.
+    detectionMode: "confirm",
+    // When NudeNet is involved (confirm/nudenet modes), classify every candidate/fine
+    // sample individually instead of a few representatives with the rest propagated —
+    // exact scene-boundary timing at the cost of more NudeNet calls. Off by default since
+    // it's slower; irrelevant to plain "nsfwjs" mode.
+    nudenetExactTiming: false,
   };
 
   /** @type {Record<string, any>} */
@@ -45,8 +52,10 @@
       "existingDialogOverlay", "existingFileName", "useExistingBtn", "rescanBtn",
       "transcodeWarningOverlay", "transcodeFileName", "transcodeConfirmBtn", "transcodeCancelBtn",
       "settingsDialogOverlay", "sensitivityInput", "sensitivityValue", "blurAdvanceInput",
-      "scanIntervalInput", "adaptiveScanInput", "nudeNetConfirmInput", "rememberStateInput", "closeSettingsBtn",
+      "scanIntervalInput", "adaptiveScanInput", "rememberStateInput", "closeSettingsBtn",
+      "modeNsfwjsInput", "modeConfirmInput", "modeNudenetInput", "nudenetExactTimingInput",
     ].forEach((id) => { els[id] = document.getElementById(id); });
+    els.detectionModeInputs = [els.modeNsfwjsInput, els.modeConfirmInput, els.modeNudenetInput];
   }
 
   function wireStaticUI() {
@@ -68,7 +77,8 @@
     els.blurAdvanceInput.addEventListener("change", onBlurAdvanceChange);
     els.scanIntervalInput.addEventListener("change", onScanIntervalChange);
     els.adaptiveScanInput.addEventListener("change", onAdaptiveScanChange);
-    els.nudeNetConfirmInput.addEventListener("change", onNudeNetConfirmChange);
+    els.detectionModeInputs.forEach((input) => input.addEventListener("change", onDetectionModeChange));
+    els.nudenetExactTimingInput.addEventListener("change", onNudenetExactTimingChange);
     els.rememberStateInput.addEventListener("change", onRememberStateChange);
 
     els.useExistingBtn.addEventListener("click", async () => {
@@ -111,7 +121,13 @@
 
   async function loadSettings() {
     const s = await VMDB.get("settings", "app");
-    return Object.assign({}, DEFAULT_SETTINGS, s || {});
+    const merged = Object.assign({}, DEFAULT_SETTINGS, s || {});
+    // Migrate the old boolean setting (pre-"NudeNet only" mode) to the new 3-way mode.
+    if (s && !("detectionMode" in s) && "nudeNetConfirm" in s) {
+      merged.detectionMode = s.nudeNetConfirm ? "confirm" : "nsfwjs";
+    }
+    delete merged.nudeNetConfirm;
+    return merged;
   }
 
   async function persistSettings() {
@@ -124,7 +140,8 @@
     els.blurAdvanceInput.value = settings.blurAdvance;
     els.scanIntervalInput.value = settings.scanInterval;
     els.adaptiveScanInput.checked = !!settings.adaptiveScan;
-    els.nudeNetConfirmInput.checked = !!settings.nudeNetConfirm;
+    els.detectionModeInputs.forEach((input) => { input.checked = input.value === settings.detectionMode; });
+    els.nudenetExactTimingInput.checked = !!settings.nudenetExactTiming;
     els.rememberStateInput.checked = !!settings.rememberState;
   }
 
@@ -163,8 +180,14 @@
     persistSettings();
   }
 
-  function onNudeNetConfirmChange(e) {
-    settings.nudeNetConfirm = !!e.target.checked;
+  function onDetectionModeChange(e) {
+    if (!e.target.checked) return;
+    settings.detectionMode = e.target.value;
+    persistSettings();
+  }
+
+  function onNudenetExactTimingChange(e) {
+    settings.nudenetExactTiming = !!e.target.checked;
     persistSettings();
   }
 
@@ -318,7 +341,8 @@
         sampleInterval: settings.scanInterval,
         adaptive: settings.adaptiveScan,
         sensitivity: settings.sensitivity,
-        nudeNetConfirm: settings.nudeNetConfirm,
+        detectionMode: settings.detectionMode,
+        exactTiming: settings.nudenetExactTiming,
       });
 
       const segments = VMScanner.mergeSegments(samples, settings.sensitivity, interval);

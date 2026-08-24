@@ -113,32 +113,63 @@
       <span>Scan interval (seconds)</span>
       <input type="number" id="scanIntervalInput" min="0.1" step="0.1">
       <span class="hint">Gap between sampled frames while scanning. Smaller = more accurate
-        scene start/end times, but a slower scan. Applies to scans started after this is
-        changed — rescan a video to apply it retroactively.</span>
+        scene start/end times, but a slower scan. With adaptive scan (below) on, this is the
+        gap used <em>inside</em> a region it's already refining — the initial sweep of the
+        rest of the video uses a coarser, auto-derived gap (roughly 5x this value, capped at
+        5s) regardless of how small you set this. Turn adaptive scan off if you need this
+        exact gap applied everywhere. Applies to scans started after this is changed —
+        rescan a video to apply it retroactively.</span>
     </label>
 
     <label class="field checkbox-field">
       <input type="checkbox" id="adaptiveScanInput">
       <span>Adaptive two-pass scan (faster)</span>
     </label>
-    <p class="hint" style="margin-top:-10px;">Scans a fast coarse pass first, then re-scans
-      at the full "scan interval" precision only around anything it finds. Much faster on
-      long videos, since most of a video is usually clean. A scene shorter than the coarse
-      pass's gap (a few seconds) that falls entirely between two clean samples can still be
-      missed — turn this off for maximum thoroughness on content you don't trust a coarse
-      pass with. Changing this — like scan interval — only affects scans started afterward.</p>
+    <p class="hint" style="margin-top:-10px;">Scans a fast coarse pass first (gap: roughly
+      5x the scan interval above, capped at 5s), then re-scans at the full scan-interval
+      precision only around anything that pass finds. Much faster on long videos, since most
+      of a video is usually clean. A scene shorter than the coarse pass's gap that falls
+      entirely between two clean coarse samples can still be missed — turn this off for
+      maximum thoroughness on content you don't trust a coarse pass with, or on content with
+      very brief scenes. Changing this — like scan interval — only affects scans started
+      afterward.</p>
+
+    <div class="field">
+      <span>Detection method</span>
+      <label class="checkbox-field">
+        <input type="radio" name="detectionMode" id="modeNsfwjsInput" value="nsfwjs">
+        <span>NSFWJS only (fastest)</span>
+      </label>
+      <label class="checkbox-field">
+        <input type="radio" name="detectionMode" id="modeConfirmInput" value="confirm">
+        <span>NSFWJS + NudeNet confirmation (recommended)</span>
+      </label>
+      <label class="checkbox-field">
+        <input type="radio" name="detectionMode" id="modeNudenetInput" value="nudenet">
+        <span>NudeNet only (most precise, slowest)</span>
+      </label>
+      <span class="hint">NSFWJS alone sometimes flags frames with a lot of visible skin but
+        no actual nudity (bare neck/shoulders/midriff, etc) — it has no real anatomical
+        understanding. NudeNet is a real body-part detector: it only counts a frame if it
+        specifically finds an exposed breast, genitals, or anus. "Confirmation" uses NSFWJS
+        as a cheap first pass and only asks NudeNet to double-check frames NSFWJS already
+        flagged — good balance of speed and accuracy. "NudeNet only" skips NSFWJS entirely
+        and runs the body-part detector directly on every sampled frame — most accurate,
+        since NSFWJS never gets a vote. Either NudeNet mode downloads its ~12MB model the
+        first time it's needed.</span>
+    </div>
 
     <label class="field checkbox-field">
-      <input type="checkbox" id="nudeNetConfirmInput">
-      <span>Confirm with body-part detector (NudeNet)</span>
+      <input type="checkbox" id="nudenetExactTimingInput">
+      <span>Exact NudeNet timing (no averaging)</span>
     </label>
-    <p class="hint" style="margin-top:-10px;">NSFWJS alone sometimes flags frames with a lot
-      of visible skin but no actual nudity (bare neck/shoulders/midriff, etc). When on,
-      anything NSFWJS flags gets double-checked against a real body-part detector, and only
-      counts if it specifically finds exposed breast, genitals, or anus — not just skin in
-      general. Downloads an extra ~70MB model the first time it's needed, and is slower
-      per-frame than NSFWJS, but only runs on the minority of frames NSFWJS already
-      flagged, so it shouldn't noticeably slow down otherwise-clean footage.</p>
+    <p class="hint" style="margin-top:-10px;">Whenever NudeNet checks several nearby frames
+      in a row (a sustained scene), it normally only classifies a few of them and fills in
+      the rest by copying the nearest one's result — fast, but the scene's start/end time is
+      only as precise as which frames happened to get checked. Turn this on to classify
+      every single candidate frame with NudeNet instead, giving the real scene-boundary
+      time at your configured scan interval — more NudeNet calls, so slower. Only matters
+      for "confirmation" and "NudeNet only" detection modes above; ignored for NSFWJS-only.</p>
 
     <label class="field checkbox-field">
       <input type="checkbox" id="rememberStateInput">

@@ -1,114 +1,165 @@
-// Classic (non-module) Web Worker: loads a TFJS port of NudeNet (vladmandic/nudenet,
-// MIT-licensed, model files streamed from its GitHub repo via jsdelivr's GH CDN — the
-// project is archived/unmaintained but the static model files are unaffected by that) and
-// runs real body-part *object detection* (bounding boxes + per-box class), instead of
-// NSFWJS's whole-frame classification. This is what lets us blur only on an actual
-// detected exposed breast/genital/anus region instead of "this frame generally looks
-// skin-heavy" (which is what causes bare-neck/shoulder false positives with NSFWJS alone).
+// @ts-nocheck — classic worker script; `ort` comes from importScripts() below, not a
+// typed import, and this isn't part of the VMDB/VMScanner classic-script-globals app.
+// Classic (non-module) Web Worker: real body-part object detection via ONNX Runtime Web,
+// using the model from vladmandic/sd-extension-nudenet (actively maintained, MIT-licensed,
+// ~12MB) — NOT the archived vladmandic/nudenet TFJS port this worker used to load.
 //
-// Unlike scan-worker.js, this one does NOT fall back to the WASM backend: NudeNet's graph
-// (unlike NSFWJS's plain MobileNetV2) throws a tensor-rank error inside a concat op under
-// tfjs's WASM kernels ("Error in concat4D: rank of tensors[3] must be the same as the rank
-// of the rest") — confirmed by actually running it, not assumed. The upstream demo only
-// ever targeted WebGL/WebGPU too. So this worker always uses WebGL (tf.js auto-detects
-// OffscreenCanvas in a worker) and fails loudly if that's unavailable, instead of silently
-// switching to a backend that produces a broken result.
-importScripts("https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.20.0/dist/tf.min.js");
+// Why the switch: direct benchmark on the same test images, in the same environment —
+// onnxruntime-web's multi-threaded WASM backend classifies a frame in ~40-110ms here,
+// versus ~25-30 SECONDS per frame for the old TFJS/WebGL model. That's not a hardware
+// artifact either: it doesn't depend on WebGL or real GPU acceleration at all (pure WASM),
+// so it isn't subject to the "software-rendered WebGL is catastrophically slow" problem
+// the old worker had. The model is also smaller (~12MB vs ~70MB) and has a richer label
+// set (explicit female-vagina/male-penis classes instead of a single blended "vagina").
+//
+// Trade-off worth knowing: on one borderline (non-nude, swimwear) test photo, this model
+// scored "female-vagina" at 0.57 vs the old model's ~0.30 on the same image — still under
+// the app's default 0.6 sensitivity, but a real difference in calibration, not just speed.
+const ORT_BASE = "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.19.2/dist/";
+importScripts(ORT_BASE + "ort.min.js");
 
-const MODEL_URL = "https://cdn.jsdelivr.net/gh/vladmandic/nudenet@main/models/default-f16/model.json";
-const OUTPUT_NODES = ["output1", "output2", "output3"];
+const MODEL_URL = "https://cdn.jsdelivr.net/gh/vladmandic/sd-extension-nudenet@main/nudenet.onnx";
+const INPUT_SIZE = 320;
+
+// ort.min.js loads its actual WASM binary + threaded-worker glue (.wasm/.mjs) via its own
+// path auto-detection, which only works when it's loaded as a plain <script src> on the
+// main thread (it can read that script's own URL). Inside a Worker loaded via
+// importScripts(), that detection has nothing to go on and silently falls back to
+// resolving those files against *this worker's own* origin/path — i.e. our domain, not the
+// CDN — which 404s. Setting wasmPaths explicitly (before creating any session) is the
+// documented fix for hosting ort's assets somewhere other than where the page itself is
+// served from; confirmed necessary here by hitting exactly that fetch failure.
+ort.env.wasm.wasmPaths = ORT_BASE;
 
 // Index into this array = class id the model emits.
 const LABELS = [
-  "exposed anus", "exposed armpits", "belly", "exposed belly", "buttocks", "exposed buttocks",
-  "female face", "male face", "feet", "exposed feet", "breast", "exposed breast",
-  "vagina", "exposed vagina", "male breast", "exposed male breast",
+  "female-private-area", "female-face", "buttocks-bare", "female-breast-bare", "female-vagina",
+  "male-breast-bare", "anus-bare", "feet-bare", "belly", "feet", "armpits", "armpits-bare",
+  "male-face", "belly-bare", "male-penis", "anus-area", "female-breast", "buttocks",
 ];
 
-// The classes that actually count as "breast/genitals" for our purposes — deliberately
-// excludes covered breast/buttocks/belly/vagina, faces, feet, and armpits, so a bare neck
-// or midriff can never match no matter how confident the model is about *something* there.
-// "exposed buttocks" is deliberately left out too, matching the "breast and genitals" scope
-// asked for; adjust this list to widen/narrow what counts.
-const CONFIRM_LABELS = ["exposed anus", "exposed breast", "exposed vagina", "exposed male breast"];
+// The classes that actually count as "breast/genitals" for our purposes — mirrors the
+// previous model's scope (exposed breast/vagina/anus/male-breast) under this model's
+// naming. "buttocks-bare" is deliberately left out, matching the "breast and genitals"
+// scope asked for; adjust this list to widen/narrow what counts.
+const CONFIRM_LABELS = ["female-breast-bare", "female-vagina", "male-penis", "anus-bare", "male-breast-bare"];
 const CONFIRM_IDS = CONFIRM_LABELS.map((l) => LABELS.indexOf(l));
 
-function rendererInfo() {
-  try {
-    const gl = new OffscreenCanvas(1, 1).getContext("webgl2") || new OffscreenCanvas(1, 1).getContext("webgl");
-    if (!gl) return { available: false, renderer: null };
-    const dbg = gl.getExtension("WEBGL_debug_renderer_info");
-    const renderer = String(dbg ? gl.getParameter(dbg.UNMASKED_RENDERER_WEBGL) : gl.getParameter(gl.RENDERER));
-    return { available: true, renderer, software: /swiftshader|llvmpipe|software/i.test(renderer) };
-  } catch (e) {
-    return { available: false, renderer: null };
+// The multi-threaded WASM backend needs SharedArrayBuffer, which needs the page to be
+// cross-origin isolated (COOP/COEP headers). Fall back to a single thread rather than
+// fail outright if that's not available.
+const isCrossOriginIsolated = typeof self !== "undefined" && self.crossOriginIsolated === true && typeof SharedArrayBuffer !== "undefined";
+ort.env.wasm.numThreads = isCrossOriginIsolated ? ((self.navigator && self.navigator.hardwareConcurrency) || 4) : 1;
+ort.env.wasm.simd = true;
+
+let sessionPromise = null;
+function getSession() {
+  if (!sessionPromise) {
+    sessionPromise = ort.InferenceSession.create(MODEL_URL, { executionProviders: ["wasm"] });
   }
+  return sessionPromise;
 }
 
-let modelPromise = null;
-function getModel() {
-  if (!modelPromise) {
-    modelPromise = (async () => {
-      const info = rendererInfo();
-      if (!info.available) {
-        throw new Error("WebGL is not available in this browser, so the body-part detector (NudeNet) can't run.");
-      }
-      await tf.setBackend("webgl");
-      await tf.ready();
-      const model = await tf.loadGraphModel(MODEL_URL);
-      const backend = info.software ? "webgl-software (slow)" : "webgl";
-      return { model, backend };
-    })();
-  }
-  return modelPromise;
+function iou(a, b) {
+  const ax1 = a[0] - a[2] / 2, ay1 = a[1] - a[3] / 2, ax2 = a[0] + a[2] / 2, ay2 = a[1] + a[3] / 2;
+  const bx1 = b[0] - b[2] / 2, by1 = b[1] - b[3] / 2, bx2 = b[0] + b[2] / 2, by2 = b[1] + b[3] / 2;
+  const ix1 = Math.max(ax1, bx1), iy1 = Math.max(ay1, by1);
+  const ix2 = Math.min(ax2, bx2), iy2 = Math.min(ay2, by2);
+  const inter = Math.max(0, ix2 - ix1) * Math.max(0, iy2 - iy1);
+  const areaA = a[2] * a[3], areaB = b[2] * b[3];
+  return inter / (areaA + areaB - inter);
 }
 
-async function detect(model, bitmap, minScore) {
-  const buffer = tf.browser.fromPixels(bitmap);
-  const h = buffer.shape[0];
-  const w = buffer.shape[1];
-  // Preserve aspect ratio at a moderate resolution — NudeNet needs more spatial detail
-  // than NSFWJS's 224x224 square crop to localize small regions.
-  const targetH = 640;
-  const targetW = Math.round(targetH * (w / h));
-  const resized = tf.image.resizeBilinear(buffer, [targetH, targetW]);
-  const cast = tf.cast(resized, "float32");
-  const batch = tf.expandDims(cast, 0);
-
-  const [boxesT, scoresT, classesT] = await model.executeAsync(batch, OUTPUT_NODES);
-  const boxes = await boxesT.array();
-  const scores = await scoresT.data();
-  const classes = await classesT.data();
-  const nmsT = await tf.image.nonMaxSuppressionAsync(boxes[0], scores, 50, 0.5, minScore);
-  const nms = await nmsT.data();
-
-  let maxScore = 0;
-  const parts = [];
-  for (const i of nms) {
-    const classId = classes[i];
-    const score = scores[i];
-    if (CONFIRM_IDS.includes(classId)) {
-      parts.push({ score, class: LABELS[classId] });
-      if (score > maxScore) maxScore = score;
+function nms(boxes, scores, iouThresh) {
+  const idx = scores.map((s, i) => i).sort((a, b) => scores[b] - scores[a]);
+  const keep = [];
+  const suppressed = new Set();
+  for (const i of idx) {
+    if (suppressed.has(i)) continue;
+    keep.push(i);
+    for (const j of idx) {
+      if (j === i || suppressed.has(j)) continue;
+      if (iou(boxes[i], boxes[j]) > iouThresh) suppressed.add(j);
     }
   }
+  return keep;
+}
 
-  tf.dispose([buffer, resized, cast, batch, boxesT, scoresT, classesT, nmsT]);
-  return { matched: parts.length > 0, maxScore, parts };
+// `bitmap` is expected to already be a 320x320 *letterboxed* frame (aspect-preserving,
+// black-padded to a square) — see scanner.js's letterbox capture — matching exactly how
+// the upstream Python reference (sd-extension-nudenet's read_image()) prepares input, so
+// no further resizing happens here, just pixel extraction.
+async function detect(session, bitmap, minScore) {
+  const canvas = new OffscreenCanvas(INPUT_SIZE, INPUT_SIZE);
+  const ctx = canvas.getContext("2d");
+  ctx.drawImage(bitmap, 0, 0, INPUT_SIZE, INPUT_SIZE);
+  const imgData = ctx.getImageData(0, 0, INPUT_SIZE, INPUT_SIZE).data;
+
+  // HWC RGBA -> CHW RGB, normalized 0..1.
+  const plane = INPUT_SIZE * INPUT_SIZE;
+  const chw = new Float32Array(3 * plane);
+  for (let i = 0; i < plane; i++) {
+    const o = i * 4;
+    chw[i] = imgData[o] / 255;
+    chw[plane + i] = imgData[o + 1] / 255;
+    chw[2 * plane + i] = imgData[o + 2] / 255;
+  }
+
+  const tensor = new ort.Tensor("float32", chw, [1, 3, INPUT_SIZE, INPUT_SIZE]);
+  const feeds = {};
+  feeds[session.inputNames[0]] = tensor;
+  const results = await session.run(feeds);
+  const output = results[session.outputNames[0]]; // [1, 4+numClasses, numBoxes] (YOLO-style)
+  const numAttrs = output.dims[1];
+  const numBoxes = output.dims[2];
+  const data = output.data;
+
+  const boxes = [];
+  const scores = [];
+  const classIds = [];
+  for (let i = 0; i < numBoxes; i++) {
+    let maxScore = -Infinity;
+    let maxClass = -1;
+    for (let c = 4; c < numAttrs; c++) {
+      const v = data[c * numBoxes + i];
+      if (v > maxScore) {
+        maxScore = v;
+        maxClass = c - 4;
+      }
+    }
+    if (maxScore >= minScore) {
+      boxes.push([data[i], data[numBoxes + i], data[2 * numBoxes + i], data[3 * numBoxes + i]]);
+      scores.push(maxScore);
+      classIds.push(maxClass);
+    }
+  }
+  const keep = nms(boxes, scores, 0.45);
+
+  let maxConfirmScore = 0;
+  const parts = [];
+  for (const i of keep) {
+    const classId = classIds[i];
+    if (CONFIRM_IDS.includes(classId)) {
+      parts.push({ score: scores[i], class: LABELS[classId] });
+      if (scores[i] > maxConfirmScore) maxConfirmScore = scores[i];
+    }
+  }
+  return { matched: parts.length > 0, maxScore: maxConfirmScore, parts };
 }
 
 self.onmessage = async (e) => {
   const { id, bitmap, minScore } = e.data;
   try {
-    const { model, backend } = await getModel();
-    const result = await detect(model, bitmap, typeof minScore === "number" ? minScore : 0.2);
+    const session = await getSession();
+    const result = await detect(session, bitmap, typeof minScore === "number" ? minScore : 0.2);
     bitmap.close();
-    self.postMessage({ id, ok: true, backend, ...result });
+    self.postMessage({ id, ok: true, backend: isCrossOriginIsolated ? "onnx-wasm-mt" : "onnx-wasm", ...result });
   } catch (err) {
     try { bitmap.close(); } catch (e2) { /* ignore */ }
     self.postMessage({ id, ok: false, error: String((err && err.message) || err) });
   }
 };
 
-getModel().then(({ backend }) => self.postMessage({ ready: true, backend }))
+getSession()
+  .then(() => self.postMessage({ ready: true, backend: isCrossOriginIsolated ? "onnx-wasm-mt" : "onnx-wasm" }))
   .catch((err) => self.postMessage({ ready: true, error: String((err && err.message) || err) }));

@@ -761,7 +761,7 @@
     lines.push(`# Generated: ${new Date().toString()}`);
     lines.push(`# Format: start - end : probability`);
     if (!segments.length) {
-      lines.push("# No nudity scenes detected above the configured sensitivity.");
+      lines.push("# No nudity scenes detected.");
     }
     for (const seg of segments) {
       lines.push(`${formatTime(seg.start)} - ${formatTime(seg.end)} : ${seg.probability.toFixed(3)}`);

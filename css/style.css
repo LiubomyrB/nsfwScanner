@@ -317,6 +317,23 @@ html, body {
 .dialog h3 { margin: 0 0 12px; }
 .dialog p { color: var(--dim); font-size: 14px; }
 
+.timecodes-dialog { width: min(560px, 92vw); }
+.timecodes-content {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 12px 14px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 13px;
+  line-height: 1.6;
+  max-height: 50vh;
+  overflow-y: auto;
+  white-space: pre-wrap;
+  word-break: break-all;
+  color: var(--text);
+  margin: 0;
+}
+
 .field {
   display: flex;
   flex-direction: column;

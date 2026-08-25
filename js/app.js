@@ -58,7 +58,7 @@
 
   function cacheEls() {
     [
-      "settingsBtn", "openFileBtn",
+      "settingsBtn", "openFileBtn", "timecodesBtn",
       "startScreen", "pickFileBtn", "resumeBox", "resumeText", "resumeBtn", "resumeDismissBtn",
       "scanScreen", "scanProgressBar", "scanProgressText", "scanStatusText", "cancelScanBtn",
       "transcodeScreen", "transcodeProgressBar", "transcodeProgressText", "transcodeStatusText", "cancelTranscodeBtn",
@@ -69,6 +69,7 @@
       "fullscreenBtn", "enterFullscreenIcon", "exitFullscreenIcon",
       "fileInput",
       "existingDialogOverlay", "existingFileName", "useExistingBtn", "rescanBtn",
+      "timecodesDialogOverlay", "timecodesContent", "downloadTimecodesBtn", "closeTimecodesBtn",
       "transcodeWarningOverlay", "transcodeWarningTitle", "transcodeReasonText", "transcodeFileName",
       "transcodeReasonSuffix", "transcodeConfirmBtn", "transcodeCancelBtn",
       "settingsDialogOverlay", "sensitivityInput", "sensitivityValue", "blurAdvanceInput",
@@ -87,8 +88,22 @@
     els.settingsDialogOverlay.addEventListener("click", (e) => {
       if (e.target === els.settingsDialogOverlay) closeSettingsDialog();
     });
+
+    els.timecodesBtn.addEventListener("click", openTimecodesDialog);
+    els.closeTimecodesBtn.addEventListener("click", closeTimecodesDialog);
+    els.timecodesDialogOverlay.addEventListener("click", (e) => {
+      if (e.target === els.timecodesDialogOverlay) closeTimecodesDialog();
+    });
+    els.downloadTimecodesBtn.addEventListener("click", () => {
+      if (!activeVideo) return;
+      downloadTxt(activeVideo.txtContent || "", baseName(activeVideo.fileName) + "_timecodes.txt");
+    });
+
     document.addEventListener("keydown", (e) => {
-      if (e.key === "Escape" && !els.settingsDialogOverlay.classList.contains("hidden")) {
+      if (e.key !== "Escape") return;
+      if (!els.timecodesDialogOverlay.classList.contains("hidden")) {
+        closeTimecodesDialog();
+      } else if (!els.settingsDialogOverlay.classList.contains("hidden")) {
         closeSettingsDialog();
       }
     });
@@ -208,6 +223,16 @@
 
   function closeSettingsDialog() {
     els.settingsDialogOverlay.classList.add("hidden");
+  }
+
+  function openTimecodesDialog() {
+    if (!activeVideo) return;
+    els.timecodesContent.textContent = activeVideo.txtContent || "(no timecodes recorded for this scan)";
+    els.timecodesDialogOverlay.classList.remove("hidden");
+  }
+
+  function closeTimecodesDialog() {
+    els.timecodesDialogOverlay.classList.add("hidden");
   }
 
   function onSensitivityChange(e) {
@@ -599,6 +624,9 @@
       interval: record.interval,
       duration: record.duration,
       segments: VMScanner.mergeSegments(record.samples, settings.sensitivity, record.interval),
+      // The full detected-scenes txt from scan time (REPORT_FLOOR-based — see startScan —
+      // not sensitivity-filtered), shown/downloadable via the Timecodes dialog.
+      txtContent: record.txtContent,
     };
     updatePlayerControls(resumeTime || 0);
 
@@ -1114,6 +1142,7 @@
     els.scanScreen.classList.add("hidden");
     els.transcodeScreen.classList.add("hidden");
     els.playerScreen.classList.add("hidden");
+    els.timecodesBtn.classList.add("hidden");
   }
 
   function showScanScreen() {
@@ -1121,6 +1150,7 @@
     els.scanScreen.classList.remove("hidden");
     els.transcodeScreen.classList.add("hidden");
     els.playerScreen.classList.add("hidden");
+    els.timecodesBtn.classList.add("hidden");
     els.scanProgressBar.style.width = "0%";
     els.scanProgressText.textContent = "0%";
     els.scanStatusText.textContent = "Loading model…";
@@ -1131,6 +1161,7 @@
     els.scanScreen.classList.add("hidden");
     els.transcodeScreen.classList.remove("hidden");
     els.playerScreen.classList.add("hidden");
+    els.timecodesBtn.classList.add("hidden");
     els.transcodeProgressBar.style.width = "0%";
     els.transcodeProgressText.textContent = "0%";
     els.transcodeStatusText.textContent = "Starting FFmpeg…";
@@ -1143,6 +1174,7 @@
     els.playerScreen.classList.remove("hidden");
     els.resumeBox.classList.add("hidden");
     els.openFileBtn.classList.remove("hidden");
+    els.timecodesBtn.classList.remove("hidden");
   }
 
   // ---------- helpers ----------

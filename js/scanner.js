@@ -29,6 +29,18 @@
   // that causes a miss; it only exists to filter out the clearly-clean majority of frames.
   const PREFILTER_FLOOR = 0.15;
 
+  // The threshold used when building the segments that get written to the exported txt file
+  // and stored as the scan's permanent record — deliberately NOT `settings.sensitivity`. The
+  // sensitivity slider controls blur-during-playback only (recomputed live from the raw
+  // per-sample probabilities every time it's changed — see app.js's recomputeActiveSegments/
+  // loadPlayerWithData), and playback is the only place it should apply; anything a scan
+  // finds should be preserved on disk regardless of what the slider happens to be set to at
+  // scan time; a low sensitivity later shouldn't mean data quietly never got recorded in the
+  // first place. Still needs SOME positive floor (not 0) — merging on literal zero would pull
+  // in essentially every sample as "detected" (near-zero noise never actually reads as
+  // exactly 0) and collapse the whole video into one meaningless segment.
+  const REPORT_FLOOR = 0.05;
+
   // Resolve the worker scripts relative to *this script's* own location (same reasoning as
   // transcoder.js's vendored-module path) so it keeps working regardless of what directory
   // index.html is served from.
@@ -765,5 +777,6 @@
     segmentsToTxt,
     createCancelToken,
     getWorkerPool,
+    REPORT_FLOOR,
   };
 })(window);

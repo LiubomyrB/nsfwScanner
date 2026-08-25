@@ -136,6 +136,37 @@ html, body {
   background: #000;
   transition: filter .35s ease;
 }
+/* Fullscreen: the browser forces .video-wrap to fill the entire screen (overriding its
+   normal `width: min(960px, 92vw)`), but .player-surface's own sizing rule above is still
+   width-driven with only a max-height cap — its height then just follows from its intrinsic
+   aspect ratio, landing short of the screen's height for most videos. Left as plain block
+   layout, that shorter box just sits at the top, leaving an empty gap below it. Centering
+   the wrap with flex and letting the surface size by both max-width/max-height (whichever
+   constrains first) fills the screen as much as the aspect ratio allows, centered on both
+   axes, matching ordinary fullscreen video-player behavior. */
+.video-wrap:fullscreen,
+.video-wrap:-webkit-full-screen {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 100vw;
+  height: 100vh;
+  border-radius: 0;
+}
+.video-wrap:fullscreen .player-surface,
+.video-wrap:-webkit-full-screen .player-surface {
+  /* width/height auto (intrinsic size) capped by max-width/max-height would only ever
+     shrink an oversized video to fit — for anything smaller than the screen (the common
+     case) it left the video at its native pixel size instead of scaling up to use the
+     screen. object-fit: contain scales it up (or down) to fill the box on whichever axis
+     the aspect ratio allows, same as it would for a plain <video> without object-fit's help
+     — and Chromium applies object-fit to <canvas> too, so this covers both engines. */
+  width: 100%;
+  height: 100%;
+  max-width: none;
+  max-height: none;
+  object-fit: contain;
+}
 .player-surface.blurred {
   filter: blur(28px) brightness(0.7);
 }

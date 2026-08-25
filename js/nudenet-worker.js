@@ -42,7 +42,7 @@ const LABELS = [
 // previous model's scope (exposed breast/vagina/anus/male-breast) under this model's
 // naming. "buttocks-bare" is deliberately left out, matching the "breast and genitals"
 // scope asked for; adjust this list to widen/narrow what counts.
-const CONFIRM_LABELS = ["female-breast-bare", "female-vagina", "male-penis", "anus-bare", "male-breast-bare"];
+const CONFIRM_LABELS = ["female-breast-bare", "female-vagina", "male-penis", "anus-bare", "buttocks-bare"];
 const CONFIRM_IDS = CONFIRM_LABELS.map((l) => LABELS.indexOf(l));
 
 // The multi-threaded WASM backend needs SharedArrayBuffer, which needs the page to be

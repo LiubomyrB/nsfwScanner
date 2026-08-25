@@ -1,14 +1,14 @@
 // @ts-nocheck — plain multi-file classic-script app; globals (VMDB/VMScanner/VMTranscoder/tf/nsfwjs) are wired via <script> load order, not modules.
 (function () {
   const DEFAULT_SETTINGS = {
-    sensitivity: 0.6,
+    sensitivity: 0.5,
     blurAdvance: 1.5,
     rememberState: true,
-    scanInterval: 1,
+    scanInterval: 0.2,
     adaptiveScan: true,
     // "nsfwjs": NSFWJS only. "confirm": NSFWJS scans, NudeNet double-checks what it flags.
     // "nudenet": NudeNet is the primary/only classifier for every sampled frame.
-    detectionMode: "confirm",
+    detectionMode: "nudenet",
     // When NudeNet is involved (confirm/nudenet modes), classify every candidate/fine
     // sample individually instead of a few representatives with the rest propagated —
     // exact scene-boundary timing at the cost of more NudeNet calls. Off by default since
@@ -482,7 +482,10 @@
         exactTiming: settings.nudenetExactTiming,
       });
 
-      const segments = VMScanner.mergeSegments(samples, settings.sensitivity, interval);
+      // REPORT_FLOOR, not settings.sensitivity: the exported txt / stored record should
+      // capture everything the scan actually found, independent of the (playback-only,
+      // freely adjustable) sensitivity slider — see scanner.js's comment on REPORT_FLOOR.
+      const segments = VMScanner.mergeSegments(samples, VMScanner.REPORT_FLOOR, interval);
       const txt = VMScanner.segmentsToTxt(segments, keyName);
       downloadTxt(txt, baseName(keyName) + "_timecodes.txt");
 
@@ -730,10 +733,23 @@
     await seekToTime(currentPlaybackTime() + deltaSeconds);
   }
 
-  function formatControlTime(seconds) {
+  // Whether to include an hours component is decided from the video's total duration, not
+  // each individual value being formatted — otherwise the current-time label would silently
+  // grow an "0:" hours prefix mid-playback the moment it crosses the one-hour mark, while the
+  // duration label (already past it) looked different the whole time.
+  function shouldShowHours() {
+    return !!(activeVideo && activeVideo.duration >= 3600);
+  }
+
+  function formatControlTime(seconds, showHours) {
     if (!isFinite(seconds) || seconds < 0) seconds = 0;
-    const m = Math.floor(seconds / 60);
-    const s = Math.floor(seconds % 60);
+    const totalSeconds = Math.floor(seconds);
+    const h = Math.floor(totalSeconds / 3600);
+    const m = Math.floor((totalSeconds % 3600) / 60);
+    const s = totalSeconds % 60;
+    if (showHours) {
+      return `${h}:${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}`;
+    }
     return `${m}:${String(s).padStart(2, "0")}`;
   }
 
@@ -743,14 +759,15 @@
   function updatePlayerControls(t) {
     const duration = activeVideo ? activeVideo.duration : 0;
     const paused = isPausedNow();
+    const showHours = shouldShowHours();
     els.playIcon.classList.toggle("hidden", !paused);
     els.pauseIcon.classList.toggle("hidden", paused);
     els.playPauseBtn.setAttribute("aria-label", paused ? "Play" : "Pause");
     if (!draggingProgressBar) {
-      els.currentTimeLabel.textContent = formatControlTime(t);
+      els.currentTimeLabel.textContent = formatControlTime(t, showHours);
       setSeekBarPosition(duration > 0 ? t / duration : 0);
     }
-    els.durationLabel.textContent = formatControlTime(duration);
+    els.durationLabel.textContent = formatControlTime(duration, showHours);
   }
 
   function setSeekBarPosition(fraction) {
@@ -836,14 +853,14 @@
       draggingProgressBar = true;
       try { els.seekBarContainer.setPointerCapture(e.pointerId); } catch (err) { /* ignore */ }
       setSeekBarPosition(seekFractionFromEvent(e));
-      els.currentTimeLabel.textContent = formatControlTime(seekFractionFromEvent(e) * activeVideo.duration);
+      els.currentTimeLabel.textContent = formatControlTime(seekFractionFromEvent(e) * activeVideo.duration, shouldShowHours());
       clearTimeout(hideControlsTimeout);
     });
     els.seekBarContainer.addEventListener("pointermove", (e) => {
       if (!draggingProgressBar || !activeVideo) return;
       const fraction = seekFractionFromEvent(e);
       setSeekBarPosition(fraction);
-      els.currentTimeLabel.textContent = formatControlTime(fraction * activeVideo.duration);
+      els.currentTimeLabel.textContent = formatControlTime(fraction * activeVideo.duration, shouldShowHours());
     });
     els.seekBarContainer.addEventListener("pointerup", (e) => {
       if (!draggingProgressBar) return;
@@ -900,11 +917,11 @@
       showControlsTemporarily();
     });
 
-    // --- left/right arrow keys: rewind/advance 5s (matches the mediabunny example) ---
+    // --- keyboard: left/right seeks 5s, space toggles play/pause, escape exits fullscreen ---
     window.addEventListener("keydown", (e) => {
       if (!activeVideo || els.playerScreen.classList.contains("hidden")) return;
-      // Don't hijack arrow keys away from a focused form control (e.g. the sensitivity
-      // slider in Settings, which is itself arrow-key-operable).
+      // Don't hijack keys away from a focused form control (e.g. the sensitivity slider in
+      // Settings, which is itself arrow-key-operable).
       const tag = document.activeElement && document.activeElement.tagName;
       if (tag === "INPUT" || tag === "SELECT" || tag === "TEXTAREA") return;
 
@@ -912,6 +929,17 @@
         void seekBy(-SEEK_STEP_SECONDS);
       } else if (e.code === "ArrowRight") {
         void seekBy(SEEK_STEP_SECONDS);
+      } else if (e.code === "Space") {
+        // A focused <button> (e.g. right after clicking play/pause itself) already activates
+        // on Space natively — calling togglePlayPause() too would double-fire (toggle, then
+        // immediately toggle back). Let the native activation handle it in that case.
+        if (tag === "BUTTON") return;
+        void togglePlayPause();
+      } else if (e.code === "Escape" && document.fullscreenElement) {
+        // Belt-and-suspenders: browsers already guarantee Escape exits fullscreen
+        // unconditionally (can't be prevented by page JS), but calling it explicitly here
+        // costs nothing and removes any doubt.
+        document.exitFullscreen().catch(() => {});
       } else {
         return;
       }

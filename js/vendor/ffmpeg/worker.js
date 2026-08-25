@@ -58,6 +58,15 @@ const writeFile = ({ path, data }) => {
     return true;
 };
 const readFile = ({ path, encoding }) => ffmpeg.FS.readFile(path, { encoding });
+// Added locally — see const.js's comment on STAT_FILE/READ_FILE_CHUNK.
+const statFile = ({ path }) => ({ size: ffmpeg.FS.stat(path).size });
+const readFileChunk = ({ path, offset, length }) => {
+    const stream = ffmpeg.FS.open(path, "r");
+    const buffer = new Uint8Array(length);
+    const bytesRead = ffmpeg.FS.read(stream, buffer, 0, length, offset);
+    ffmpeg.FS.close(stream);
+    return bytesRead < length ? buffer.slice(0, bytesRead) : buffer;
+};
 // TODO: check if deletion works.
 const deleteFile = ({ path }) => {
     ffmpeg.FS.unlink(path);
@@ -120,6 +129,12 @@ self.onmessage = async ({ data: { id, type, data: _data }, }) => {
                 break;
             case FFMessageType.READ_FILE:
                 data = readFile(_data);
+                break;
+            case FFMessageType.STAT_FILE:
+                data = statFile(_data);
+                break;
+            case FFMessageType.READ_FILE_CHUNK:
+                data = readFileChunk(_data);
                 break;
             case FFMessageType.DELETE_FILE:
                 data = deleteFile(_data);

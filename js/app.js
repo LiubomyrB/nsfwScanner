@@ -47,10 +47,11 @@
       "startScreen", "pickFileBtn", "resumeBox", "resumeText", "resumeBtn", "resumeDismissBtn",
       "scanScreen", "scanProgressBar", "scanProgressText", "scanStatusText", "cancelScanBtn",
       "transcodeScreen", "transcodeProgressBar", "transcodeProgressText", "transcodeStatusText", "cancelTranscodeBtn",
-      "playerScreen", "video", "blurBadge", "fileNameLabel",
+      "playerScreen", "video", "blurBadge", "audioTrackSelect", "fileNameLabel",
       "fileInput",
       "existingDialogOverlay", "existingFileName", "useExistingBtn", "rescanBtn",
-      "transcodeWarningOverlay", "transcodeFileName", "transcodeConfirmBtn", "transcodeCancelBtn",
+      "transcodeWarningOverlay", "transcodeWarningTitle", "transcodeReasonText", "transcodeFileName",
+      "transcodeReasonSuffix", "transcodeConfirmBtn", "transcodeCancelBtn",
       "settingsDialogOverlay", "sensitivityInput", "sensitivityValue", "blurAdvanceInput",
       "scanIntervalInput", "scanIntervalComputedHint", "adaptiveScanInput", "rememberStateInput", "closeSettingsBtn",
       "modeNsfwjsInput", "modeConfirmInput", "modeNudenetInput", "nudenetExactTimingInput",
@@ -72,6 +73,15 @@
         closeSettingsDialog();
       }
     });
+
+    els.audioTrackSelect.addEventListener("change", onAudioTrackSelectChange);
+    // `video.audioTracks` is one persistent AudioTrackList tied to the element (the browser
+    // clears/repopulates it in place whenever a new src loads), so these listeners only need
+    // wiring once here — re-adding them per video load would just stack duplicate handlers.
+    if (els.video.audioTracks) {
+      els.video.audioTracks.addEventListener("addtrack", renderAudioTracks);
+      els.video.audioTracks.addEventListener("removetrack", renderAudioTracks);
+    }
 
     els.sensitivityInput.addEventListener("input", onSensitivityChange);
     els.blurAdvanceInput.addEventListener("change", onBlurAdvanceChange);
@@ -249,50 +259,98 @@
     });
   }
 
+  // Scanning only ever seeks a hidden <video> element and grabs canvas frames — it never
+  // touches audio — so a file whose video decodes fine but whose audio codec doesn't (the
+  // common case: an AC3/EAC3 track Chrome has no decoder for) doesn't need transcoding
+  // before it can be scanned at all. Only fix what's actually needed, when it's needed:
+  //   1. If the video/container itself can't be decoded, that has to be fixed before
+  //      scanning can happen at all (ensureVideoScannable, below) — full re-encode.
+  //   2. If audio is the only problem, scan the original file straight away, and only ask
+  //      about fixing audio afterward, right before showing the player (see
+  //      finalizeAndLoadPlayer) — fast, lossless, and skipped entirely if the user declines.
   async function openFileFlow(file, handle) {
     if (!file) return;
     const originalName = file.name;
 
-    const playableFile = await ensurePlayableFile(file);
-    if (!playableFile) {
+    const gate = await ensureVideoScannable(file, handle);
+    if (!gate) {
       showStartScreen();
       return;
     }
+    const { file: scanFile, handle: scanHandle, audioAlreadyOk } = gate;
 
     const existing = await VMDB.get("videos", originalName);
     if (existing && existing.samples && existing.samples.length) {
       showExistingDialog(
         originalName,
-        () => usePreScanned(playableFile, handle, existing, 0, true),
-        () => startScan(playableFile, handle, originalName)
+        () => usePreScanned(scanFile, scanHandle, existing, 0, true, audioAlreadyOk),
+        () => startScan(scanFile, scanHandle, originalName, audioAlreadyOk)
       );
     } else {
-      await startScan(playableFile, handle, originalName);
+      await startScan(scanFile, scanHandle, originalName, audioAlreadyOk);
     }
   }
 
   // ---------- format compatibility / ffmpeg transcode ----------
 
-  // Returns a File the <video> element can actually play: either the original
-  // file (if the browser can decode it), a freshly-transcoded MP4, or null if
-  // the browser can't play it and the user declined to convert it.
-  async function ensurePlayableFile(file) {
-    let playable = false;
+  // Gate for whether `file` can even be scanned (audio doesn't matter here — see comment
+  // above). Returns { file, handle, audioAlreadyOk } — `file`/`handle` are either the
+  // originals (video already fine) or a freshly full-transcoded replacement; `audioAlreadyOk`
+  // tells callers whether the later audio-specific check (finalizeAndLoadPlayer) can be
+  // skipped, since a full transcode fixes audio too. Returns null if the video can't be
+  // played and the user declined to convert it.
+  async function ensureVideoScannable(file, handle) {
+    let result = { ok: false, videoOk: false };
     try {
-      playable = await VMTranscoder.canBrowserPlay(file);
+      result = await VMTranscoder.checkPlayability(file);
     } catch (e) {
       console.warn("Playability check failed, assuming not playable.", e);
     }
-    if (playable) return file;
+    if (result.videoOk) return { file, handle, audioAlreadyOk: result.ok };
 
-    const confirmed = await showTranscodeWarningDialog(file.name);
+    const confirmed = await showTranscodeWarningDialog(file.name, false);
     if (!confirmed) return null;
 
-    return runTranscode(file);
+    const refreshedFile = await refreshFileHandle(file, handle);
+    const transcodeResult = await runTranscode(refreshedFile, false);
+    if (!transcodeResult) return null;
+    return { file: transcodeResult.file, handle: transcodeResult.handle, audioAlreadyOk: true };
   }
 
-  function showTranscodeWarningDialog(fileName) {
+  // A File obtained from FileSystemFileHandle.getFile() (the resume-last-video path) can go
+  // stale — reading its bytes fails with "File could not be read! Code=-1" — once too much
+  // wall-clock time passes between getFile() and the actual read. checkPlayability's own
+  // playback probe plus a warning dialog waiting on the user is exactly that kind of
+  // open-ended delay (reproduced directly: worked before the probe/dialog were added, broke
+  // after). Re-fetching right before the read that actually needs the bytes avoids it.
+  async function refreshFileHandle(file, handle) {
+    if (!handle) return file;
+    try {
+      return await handle.getFile();
+    } catch (e) {
+      console.warn("Could not refresh file handle before transcoding, using original snapshot.", e);
+      return file;
+    }
+  }
+
+  function showTranscodeWarningDialog(fileName, audioOnly) {
     els.transcodeFileName.textContent = fileName;
+    if (audioOnly) {
+      els.transcodeWarningTitle.textContent = "Audio format not supported";
+      els.transcodeReasonText.textContent = "Your browser can play the video in";
+      els.transcodeReasonSuffix.textContent =
+        "but not its audio track (unsupported audio codec). Only the audio needs to be " +
+        "converted — the video stays untouched, so this should be quick — done locally in " +
+        "your browser using FFmpeg. Nothing is uploaded anywhere.";
+    } else {
+      els.transcodeWarningTitle.textContent = "Format not supported for playback";
+      els.transcodeReasonText.textContent = "Your browser can't play";
+      els.transcodeReasonSuffix.textContent =
+        "directly (unsupported container/codec). It can be converted to MP4 (H.264/AAC) " +
+        "locally in your browser using FFmpeg before scanning and playback. This runs " +
+        "entirely on your device — nothing is uploaded anywhere — but it can take a while " +
+        "for large files.";
+    }
     els.transcodeWarningOverlay.classList.remove("hidden");
     return new Promise((resolve) => {
       pendingTranscodeResolve = resolve;
@@ -309,16 +367,44 @@
     if (resolve) resolve(confirmed);
   }
 
-  async function runTranscode(file) {
+  // Returns { file, handle, savedToDisk } on success, or null if cancelled/failed.
+  async function runTranscode(file, audioOnly) {
+    // Best-effort: let the user pick where the transcoded output is saved on disk instead of
+    // it only ever existing as an in-memory Blob for the rest of the session — meaningful for
+    // a large file. Called as the very first thing here (right after the "Transcode" button's
+    // click resolves the warning dialog's promise) to stay as close as possible to the
+    // original user gesture, since file-picker APIs generally need one. If the picker isn't
+    // available, the user cancels it, or it fails for any reason, this just falls back to
+    // keeping the result in memory — same as before this feature existed.
+    let saveHandle = null;
+    if (window.showSaveFilePicker) {
+      try {
+        const ext = audioOnly ? extOf(file.name) : ".mp4";
+        const suggestedName = baseName(file.name) + ext;
+        const mimeType = audioOnly ? (file.type || "video/x-matroska") : "video/mp4";
+        saveHandle = await window.showSaveFilePicker({
+          suggestedName,
+          types: [{ description: "Video", accept: { [mimeType]: [ext] } }],
+        });
+      } catch (e) {
+        if (e && e.name !== "AbortError") {
+          console.warn("Save-location picker failed, keeping transcoded file in memory instead.", e);
+        }
+        saveHandle = null;
+      }
+    }
+
     showTranscodeScreen();
     transcodeCancelToken = VMTranscoder.createCancelToken();
     try {
-      const outFile = await VMTranscoder.transcodeToMp4(file, {
+      const transcodeFn = audioOnly ? VMTranscoder.remuxAudioOnly : VMTranscoder.transcodeToMp4;
+      const result = await transcodeFn(file, {
         onProgress: updateTranscodeProgress,
         onStatus: (msg) => { els.transcodeStatusText.textContent = msg; },
         token: transcodeCancelToken,
+        saveHandle,
       });
-      return outFile;
+      return result;
     } catch (e) {
       if (e && e.cancelled) return null;
       console.error(e);
@@ -344,14 +430,17 @@
     pendingExisting = null;
   }
 
-  async function usePreScanned(file, handle, record, resumeTime, resumePaused) {
+  // `audioAlreadyOk` (from ensureVideoScannable's gate) tells finalizeAndLoadPlayer whether
+  // it can skip its own audio check — true whenever a full transcode already happened, since
+  // that fixes audio too; otherwise finalizeAndLoadPlayer checks fresh.
+  async function usePreScanned(file, handle, record, resumeTime, resumePaused, audioAlreadyOk) {
     await VMDB.put("meta", { id: "app", lastOpenedFileName: record.fileName });
-    await loadPlayerWithData(file, handle, record, resumeTime, resumePaused);
+    await finalizeAndLoadPlayer(file, handle, record, resumeTime, resumePaused, audioAlreadyOk);
   }
 
   // ---------- scanning ----------
 
-  async function startScan(file, handle, originalName) {
+  async function startScan(file, handle, originalName, audioAlreadyOk) {
     const keyName = originalName || file.name;
     showScanScreen();
     cancelToken = VMScanner.createCancelToken();
@@ -391,7 +480,7 @@
       await VMDB.put("videos", record);
       await VMDB.put("meta", { id: "app", lastOpenedFileName: keyName });
 
-      await loadPlayerWithData(file, handle, record, 0, true);
+      await finalizeAndLoadPlayer(file, handle, record, 0, true, audioAlreadyOk);
     } catch (e) {
       if (e && e.cancelled) {
         showStartScreen();
@@ -401,6 +490,49 @@
       alert("Scanning failed: " + (e && e.message ? e.message : e));
       showStartScreen();
     }
+  }
+
+  // Last gate before the player actually shows: unlike ensureVideoScannable (which must be
+  // satisfied before scanning can even happen), an audio problem doesn't block anything
+  // scanning-related, so it's only dealt with here, right before playback. If the user
+  // declines the fix, they still get the player — just without sound — rather than losing
+  // the scan (which could've been slow) they already sat through over something that only
+  // affects audio.
+  async function finalizeAndLoadPlayer(file, handle, record, resumeTime, resumePaused, audioAlreadyOk) {
+    let finalFile = file;
+    let finalHandle = handle;
+
+    if (!audioAlreadyOk) {
+      let result = { ok: true };
+      try {
+        result = await VMTranscoder.checkPlayability(file);
+      } catch (e) {
+        console.warn("Playability check failed before loading player, proceeding without an audio fix.", e);
+      }
+      if (!result.ok) {
+        const confirmed = await showTranscodeWarningDialog(file.name, true);
+        if (confirmed) {
+          const refreshedFile = await refreshFileHandle(file, handle);
+          const transcodeResult = await runTranscode(refreshedFile, true);
+          if (transcodeResult) {
+            finalFile = transcodeResult.file;
+            finalHandle = transcodeResult.handle;
+            record.transcoded = true;
+            // Only overwrite a previously-stored handle when we actually got a new one (the
+            // user picked a save location) — an in-memory-only result can't be silently
+            // re-opened after a reload anyway, so keeping the old handle (if any) around lets
+            // auto-resume still work, just re-offering this same fix next time.
+            if (finalHandle) record.fileHandle = finalHandle;
+            record.updatedAt = Date.now();
+            await VMDB.put("videos", record);
+          }
+          // Failed/cancelled transcode: fall through and play the original (silent) file
+          // rather than stranding the user after a successful scan.
+        }
+      }
+    }
+
+    await loadPlayerWithData(finalFile, finalHandle, record, resumeTime, resumePaused);
   }
 
   function updateScanProgress(pct) {
@@ -426,6 +558,10 @@
     currentObjectUrl = URL.createObjectURL(file);
 
     els.fileNameLabel.textContent = record.fileName + (record.transcoded ? " (converted for playback)" : "");
+    // Hide any stale track list from a previous video immediately, rather than waiting for
+    // the browser to actually clear/repopulate audioTracks after the new src loads.
+    els.audioTrackSelect.classList.add("hidden");
+    els.audioTrackSelect.innerHTML = "";
     els.video.src = currentObjectUrl;
     setBlur(false);
     showPlayerScreen();
@@ -433,6 +569,7 @@
     els.video.addEventListener(
       "loadedmetadata",
       () => {
+        renderAudioTracks();
         if (resumeTime) {
           try {
             els.video.currentTime = Math.min(resumeTime, Math.max(0, els.video.duration - 0.1));
@@ -479,6 +616,41 @@
     els.blurBadge.classList.toggle("hidden", !on);
   }
 
+  // Populates the audio-track <select> from the native HTMLMediaElement.audioTracks list
+  // (see js/transcoder.js for why a transcoded file can have more than one), and hides it
+  // entirely for the common case of 0 or 1 tracks — nothing to switch between. Browser
+  // support for this API varies (solid in Chrome/Edge, weaker in Firefox/Safari); on a
+  // browser without it `els.video.audioTracks` is undefined and the control just stays
+  // hidden rather than erroring.
+  function renderAudioTracks() {
+    const list = els.video.audioTracks;
+    if (!list || list.length <= 1) {
+      els.audioTrackSelect.classList.add("hidden");
+      els.audioTrackSelect.innerHTML = "";
+      return;
+    }
+    els.audioTrackSelect.innerHTML = "";
+    for (let i = 0; i < list.length; i++) {
+      const track = list[i];
+      const opt = document.createElement("option");
+      opt.value = track.id;
+      opt.textContent = track.label || (track.language ? `Track ${i + 1} (${track.language})` : `Track ${i + 1}`);
+      if (track.enabled) opt.selected = true;
+      els.audioTrackSelect.appendChild(opt);
+    }
+    els.audioTrackSelect.classList.remove("hidden");
+  }
+
+  function onAudioTrackSelectChange(e) {
+    const list = els.video.audioTracks;
+    if (!list) return;
+    const chosenId = e.target.value;
+    // Explicit per the spec's "only one enabled at a time" rule — browsers are supposed to
+    // auto-disable the others when one is set enabled, but setting it ourselves here doesn't
+    // rely on that being implemented correctly everywhere.
+    for (let i = 0; i < list.length; i++) list[i].enabled = list[i].id === chosenId;
+  }
+
   function maybePersistState(force) {
     if (!activeVideo || !settings.rememberState) return;
     const now = Date.now();
@@ -522,13 +694,15 @@
     showResumeBanner(record);
   }
 
-  // Runs a re-obtained "last opened" file through the same playability/transcode
-  // gate as a fresh pick, then loads the player at the remembered position.
+  // Runs a re-obtained "last opened" file through the same video-scannable gate as a fresh
+  // pick (video must already have been fine for this record to exist at all, but re-check
+  // rather than assume), then loads the player at the remembered position — same
+  // audio-fix-if-needed gate as any other path to the player, via finalizeAndLoadPlayer.
   // Returns true if the player was shown, false if the user backed out.
   async function resumeWithFile(file, handle, record) {
-    const playableFile = await ensurePlayableFile(file);
-    if (!playableFile) return false;
-    await loadPlayerWithData(playableFile, handle, record, record.lastCurrentTime, record.lastPaused);
+    const gate = await ensureVideoScannable(file, handle);
+    if (!gate) return false;
+    await usePreScanned(gate.file, gate.handle, record, record.lastCurrentTime, record.lastPaused, gate.audioAlreadyOk);
     return true;
   }
 
@@ -622,5 +796,10 @@
   function baseName(name) {
     const idx = name.lastIndexOf(".");
     return idx > 0 ? name.slice(0, idx) : name;
+  }
+
+  function extOf(name) {
+    const idx = name.lastIndexOf(".");
+    return idx >= 0 ? name.slice(idx) : ".mkv";
   }
 })();

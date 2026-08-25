@@ -42,6 +42,8 @@ export class FFmpeg {
                     case FFMessageType.CREATE_DIR:
                     case FFMessageType.LIST_DIR:
                     case FFMessageType.DELETE_DIR:
+                    case FFMessageType.STAT_FILE:
+                    case FFMessageType.READ_FILE_CHUNK:
                         this.#resolves[id](data);
                         break;
                     case FFMessageType.LOG:
@@ -257,6 +259,27 @@ export class FFmpeg {
     encoding = "binary", { signal } = {}) => this.#send({
         type: FFMessageType.READ_FILE,
         data: { path, encoding },
+    }, undefined, signal);
+    /**
+     * Added locally (not part of upstream @ffmpeg/ffmpeg) — see const.js's comment on
+     * STAT_FILE/READ_FILE_CHUNK. Returns { size } for `path` without reading its content.
+     *
+     * @category File System
+     */
+    statFile = (path, { signal } = {}) => this.#send({
+        type: FFMessageType.STAT_FILE,
+        data: { path },
+    }, undefined, signal);
+    /**
+     * Added locally — reads `length` bytes of `path` starting at `offset`, without reading
+     * anything else. Lets a caller stream a large output file out in bounded pieces instead
+     * of pulling the whole thing into memory via readFile().
+     *
+     * @category File System
+     */
+    readFileChunk = (path, offset, length, { signal } = {}) => this.#send({
+        type: FFMessageType.READ_FILE_CHUNK,
+        data: { path, offset, length },
     }, undefined, signal);
     /**
      * Delete a file.

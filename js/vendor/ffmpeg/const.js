@@ -20,4 +20,11 @@ export var FFMessageType;
     FFMessageType["LOG"] = "LOG";
     FFMessageType["MOUNT"] = "MOUNT";
     FFMessageType["UNMOUNT"] = "UNMOUNT";
+    // Added locally (not part of upstream @ffmpeg/ffmpeg): readFile() always reads a whole
+    // file into one Uint8Array, which for a multi-GB transcode output means materializing the
+    // entire thing in memory at once just to hand it off — see transcoder.js's
+    // readFileInChunks() for why these exist and how they're used to stream output to disk in
+    // bounded pieces instead.
+    FFMessageType["STAT_FILE"] = "STAT_FILE";
+    FFMessageType["READ_FILE_CHUNK"] = "READ_FILE_CHUNK";
 })(FFMessageType || (FFMessageType = {}));

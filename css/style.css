@@ -151,6 +151,22 @@ html, body {
   letter-spacing: .3px;
   pointer-events: none;
 }
+.audio-track-select {
+  position: absolute;
+  bottom: 14px;
+  left: 14px;
+  background: rgba(0,0,0,.65);
+  color: #fff;
+  border: none;
+  border-radius: 8px;
+  padding: 6px 10px;
+  font-size: 13px;
+  letter-spacing: .3px;
+  cursor: pointer;
+}
+.audio-track-select option {
+  color: #000;
+}
 .file-name-label {
   margin-top: 10px;
   color: var(--dim);

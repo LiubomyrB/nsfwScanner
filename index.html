@@ -59,6 +59,7 @@
   <div id="videoWrap" class="video-wrap">
     <video id="video" playsinline></video>
     <div id="blurBadge" class="blur-badge hidden">🔒 blurred</div>
+    <select id="audioTrackSelect" class="audio-track-select hidden" title="Audio track" aria-label="Audio track"></select>
   </div>
   <div id="fileNameLabel" class="file-name-label"></div>
 </div>
@@ -80,11 +81,9 @@
 <!-- "Unsupported format, offer to transcode" warning dialog -->
 <div id="transcodeWarningOverlay" class="dialog-overlay hidden">
   <div class="dialog" role="dialog" aria-modal="true">
-    <h3>Format not supported for playback</h3>
-    <p>Your browser can't play <span id="transcodeFileName"></span> directly (unsupported
-      container/codec). It can be converted to MP4 (H.264/AAC) locally in your browser using
-      FFmpeg before scanning and playback. This runs entirely on your device — nothing is
-      uploaded anywhere — but it can take a while for large files.</p>
+    <h3 id="transcodeWarningTitle">Format not supported for playback</h3>
+    <p><span id="transcodeReasonText"></span> <span id="transcodeFileName"></span>
+      <span id="transcodeReasonSuffix"></span></p>
     <div class="dialog-actions">
       <button id="transcodeConfirmBtn" class="btn primary">Convert with FFmpeg</button>
       <button id="transcodeCancelBtn" class="btn">Cancel</button>

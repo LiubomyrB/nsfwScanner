@@ -228,6 +228,17 @@
     return Math.max(lo, Math.min(hi, v));
   }
 
+  // Shared with app.js (via VMScanner.computeCoarseInterval) so the settings UI can show the
+  // real coarse-pass gap without duplicating — and risking drifting from — this formula.
+  //
+  // The lower bound (2x fineInterval) is itself clamped to at most the 5s cap: without that,
+  // a fineInterval above 2.5s would make the "floor" exceed the "ceiling" (e.g. fineInterval=3
+  // gives a naive floor of 6, above the 5 cap), and clamp()'s Math.max(lo, ...) would return
+  // that floor uncapped — silently breaking the documented "capped at 5s" behavior.
+  function computeCoarseInterval(fineInterval) {
+    return clamp(fineInterval * 5, Math.min(Math.max(fineInterval * 2, 0.3), 5), 5);
+  }
+
   function mergeWindows(windows) {
     if (!windows.length) return [];
     const sorted = windows.slice().sort((a, b) => a.start - b.start);
@@ -315,7 +326,7 @@
     // override that for most of the video (only "refine windows" ever reach the fine
     // interval; everywhere else stays at the coarse one) — previously reproduced exactly
     // this way: 0.1s fine interval produced a 1.5s coarse pass regardless.
-    const coarseInterval = clamp(fineInterval * 5, Math.max(fineInterval * 2, 0.3), 5);
+    const coarseInterval = computeCoarseInterval(fineInterval);
 
     if (opts.onStatus) opts.onStatus("Scanning (coarse pass)…");
     const coarseTimes = buildUniformTimes(duration, coarseInterval);
@@ -750,6 +761,7 @@
     scanVideoFile,
     mergeSegments,
     formatTime,
+    computeCoarseInterval,
     segmentsToTxt,
     createCancelToken,
     getWorkerPool,

@@ -106,12 +106,14 @@
     <label class="field">
       <span>Blur in advance (seconds)</span>
       <input type="number" id="blurAdvanceInput" min="0" step="0.1">
-      <span class="hint">Start blurring this many seconds before a flagged scene begins.</span>
+      <span class="hint">Start blurring this many seconds before a flagged scene begins, and
+        keep it blurred for this many seconds after the scene ends.</span>
     </label>
 
     <label class="field">
       <span>Scan interval (seconds)</span>
       <input type="number" id="scanIntervalInput" min="0.1" step="0.1">
+      <span class="hint" id="scanIntervalComputedHint"></span>
       <span class="hint">Gap between sampled frames while scanning. Smaller = more accurate
         scene start/end times, but a slower scan. With adaptive scan (below) on, this is the
         gap used <em>inside</em> a region it's already refining — the initial sweep of the

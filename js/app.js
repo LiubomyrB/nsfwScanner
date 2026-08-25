@@ -52,7 +52,7 @@
       "existingDialogOverlay", "existingFileName", "useExistingBtn", "rescanBtn",
       "transcodeWarningOverlay", "transcodeFileName", "transcodeConfirmBtn", "transcodeCancelBtn",
       "settingsDialogOverlay", "sensitivityInput", "sensitivityValue", "blurAdvanceInput",
-      "scanIntervalInput", "adaptiveScanInput", "rememberStateInput", "closeSettingsBtn",
+      "scanIntervalInput", "scanIntervalComputedHint", "adaptiveScanInput", "rememberStateInput", "closeSettingsBtn",
       "modeNsfwjsInput", "modeConfirmInput", "modeNudenetInput", "nudenetExactTimingInput",
     ].forEach((id) => { els[id] = document.getElementById(id); });
     els.detectionModeInputs = [els.modeNsfwjsInput, els.modeConfirmInput, els.modeNudenetInput];
@@ -76,6 +76,7 @@
     els.sensitivityInput.addEventListener("input", onSensitivityChange);
     els.blurAdvanceInput.addEventListener("change", onBlurAdvanceChange);
     els.scanIntervalInput.addEventListener("change", onScanIntervalChange);
+    els.scanIntervalInput.addEventListener("input", updateScanIntervalComputedHint);
     els.adaptiveScanInput.addEventListener("change", onAdaptiveScanChange);
     els.detectionModeInputs.forEach((input) => input.addEventListener("change", onDetectionModeChange));
     els.nudenetExactTimingInput.addEventListener("change", onNudenetExactTimingChange);
@@ -143,6 +144,25 @@
     els.detectionModeInputs.forEach((input) => { input.checked = input.value === settings.detectionMode; });
     els.nudenetExactTimingInput.checked = !!settings.nudenetExactTiming;
     els.rememberStateInput.checked = !!settings.rememberState;
+    updateScanIntervalComputedHint();
+  }
+
+  // Shows the actual gap each pass of an adaptive scan will use, computed from whatever's
+  // currently typed in the scan-interval field (not just the last-saved setting) — the
+  // formula itself lives in VMScanner.computeCoarseInterval so this can't drift from what
+  // scanAdaptive actually does. Bound to the input's "input" event so it updates live as the
+  // user types, before the value is even committed via "change"/persistSettings.
+  function updateScanIntervalComputedHint() {
+    const v = parseFloat(els.scanIntervalInput.value);
+    const fineInterval = isFinite(v) && v >= 0.1 ? v : DEFAULT_SETTINGS.scanInterval;
+    if (!els.adaptiveScanInput.checked) {
+      els.scanIntervalComputedHint.textContent = `Applied everywhere: every ${fineInterval}s.`;
+      return;
+    }
+    const coarseInterval = VMScanner.computeCoarseInterval(fineInterval);
+    els.scanIntervalComputedHint.textContent =
+      `1st pass (whole video): every ${coarseInterval.toFixed(2)}s. ` +
+      `2nd pass (regions it flags): every ${fineInterval}s.`;
   }
 
   function openSettingsDialog() {
@@ -173,11 +193,13 @@
     settings.scanInterval = isFinite(v) && v >= 0.1 ? v : DEFAULT_SETTINGS.scanInterval;
     els.scanIntervalInput.value = settings.scanInterval;
     persistSettings();
+    updateScanIntervalComputedHint();
   }
 
   function onAdaptiveScanChange(e) {
     settings.adaptiveScan = !!e.target.checked;
     persistSettings();
+    updateScanIntervalComputedHint();
   }
 
   function onDetectionModeChange(e) {
@@ -424,11 +446,29 @@
     );
   }
 
+  // Two segments' blur windows can be meant to touch exactly (one segment's end equal to
+  // the next segment's advance-adjusted start), e.g. blurAdvance=1 turning a scene starting
+  // at 16.6 into a window opening at 16.6-1=15.6, right where a prior scene's window ends.
+  // `seg.start - advance` is float arithmetic though (16.6 - 1 === 15.600000000000001, not
+  // 15.6), so a currentTime that lands on exactly 15.6 satisfies neither segment's condition
+  // — reproduced directly: blur briefly clears for one frame at that exact boundary before
+  // reappearing. This tolerance absorbs that kind of float noise; it's far below anything a
+  // viewer could perceive as an early/late blur.
+  const BLUR_BOUNDARY_EPSILON = 0.05;
+
   function onVideoTimeUpdate() {
     if (activeVideo) {
       const t = els.video.currentTime;
+      // "Blur in advance" pads both edges of a flagged scene by the same amount: blur turns
+      // on this many seconds before it starts, and stays on this many seconds after it ends
+      // — a scene detected as ending abruptly (e.g. right when nudity happens to leave frame)
+      // often still needs a moment of cover on the way out, same as it does coming in.
       const advance = settings.blurAdvance || 0;
-      const shouldBlur = activeVideo.segments.some((seg) => t >= seg.start - advance && t < seg.end);
+      const shouldBlur = activeVideo.segments.some(
+        (seg) =>
+          t >= seg.start - advance - BLUR_BOUNDARY_EPSILON &&
+          t < seg.end + advance + BLUR_BOUNDARY_EPSILON
+      );
       setBlur(shouldBlur);
     }
     maybePersistState(false);

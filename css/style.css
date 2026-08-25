@@ -129,14 +129,14 @@ html, body {
   overflow: hidden;
   box-shadow: 0 10px 40px rgba(0,0,0,.5);
 }
-#video {
+.player-surface {
   display: block;
   width: 100%;
   max-height: 80vh;
   background: #000;
   transition: filter .35s ease;
 }
-#video.blurred {
+.player-surface.blurred {
   filter: blur(28px) brightness(0.7);
 }
 .blur-badge {
@@ -150,6 +150,92 @@ html, body {
   font-size: 13px;
   letter-spacing: .3px;
   pointer-events: none;
+}
+/* Overlaid at the bottom of the video/canvas — like the video-wrap's other overlays
+   (blur-badge, audio-track-select) — shown on pointer movement over the player and hidden
+   after a couple seconds of inactivity, same behavior as the mediabunny example this is
+   modeled on. */
+.player-controls {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  padding: 26px 14px 10px;
+  background: linear-gradient(to top, rgba(0,0,0,.75), rgba(0,0,0,0));
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity .2s ease;
+}
+.player-controls.shown {
+  opacity: 1;
+  pointer-events: auto;
+}
+.controls-row {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  margin-top: 8px;
+}
+.control-icon-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: none;
+  border: none;
+  color: #fff;
+  padding: 6px;
+  border-radius: 6px;
+  cursor: pointer;
+  flex: none;
+}
+.control-icon-btn:hover { background: rgba(255,255,255,.15); }
+.time-label {
+  color: #eef0f3;
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  flex: none;
+  text-align: center;
+}
+.time-sep { color: rgba(255,255,255,.5); font-size: 12px; margin: 0 2px; }
+.controls-spacer { flex: 1; }
+
+.seek-bar-container, .volume-bar-container {
+  position: relative;
+  cursor: pointer;
+}
+.seek-bar-container {
+  height: 5px;
+  background: rgba(255,255,255,.25);
+  border-radius: 999px;
+}
+.seek-bar-fill, .volume-bar-fill {
+  height: 100%;
+  width: 0%;
+  background: var(--accent);
+  border-radius: 999px;
+}
+.seek-bar-handle, .volume-bar-handle {
+  position: absolute;
+  top: 50%;
+  left: 0%;
+  width: 11px;
+  height: 11px;
+  background: var(--accent);
+  border-radius: 50%;
+  transform: translate(-50%, -50%);
+  box-shadow: 0 0 0 3px rgba(0,0,0,.25);
+}
+
+.volume-control {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.volume-bar-container {
+  width: 70px;
+  height: 4px;
+  background: rgba(255,255,255,.25);
+  border-radius: 999px;
 }
 .audio-track-select {
   position: absolute;

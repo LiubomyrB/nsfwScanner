@@ -26,6 +26,21 @@
   let pendingExisting = null;
   let pendingTranscodeResolve = null;
   let lastPersistAt = 0;
+  // "native" (plain <video>, the default/preferred path whenever it works) or "mediabunny"
+  // (canvas + Web Audio playback via js/mediabunny-player.js — used only as a fallback for
+  // files whose audio the browser can't decode natively but mediabunny can, e.g. AC3/E-AC-3,
+  // avoiding an FFmpeg transcode entirely for those; see finalizeAndLoadPlayer). Kept as an
+  // explicit, switchable option rather than replacing the native path outright.
+  let activeEngine = "native";
+  let mediabunnyPlayer = null; // the controller from VMMediabunnyPlayer.create(), when active
+
+  // Player-controls overlay state (see wirePlayerControls) — modeled on the mediabunny
+  // example player at https://mediabunny.dev/examples/media-player/.
+  let volume = 0.7;
+  let volumeMuted = false;
+  let draggingProgressBar = false;
+  let draggingVolumeBar = false;
+  let hideControlsTimeout = null;
 
   document.addEventListener("DOMContentLoaded", init);
 
@@ -47,7 +62,11 @@
       "startScreen", "pickFileBtn", "resumeBox", "resumeText", "resumeBtn", "resumeDismissBtn",
       "scanScreen", "scanProgressBar", "scanProgressText", "scanStatusText", "cancelScanBtn",
       "transcodeScreen", "transcodeProgressBar", "transcodeProgressText", "transcodeStatusText", "cancelTranscodeBtn",
-      "playerScreen", "video", "blurBadge", "audioTrackSelect", "fileNameLabel",
+      "playerScreen", "videoWrap", "video", "mediabunnyCanvas", "blurBadge", "audioTrackSelect", "fileNameLabel",
+      "playerControls", "playPauseBtn", "playIcon", "pauseIcon", "currentTimeLabel", "durationLabel",
+      "seekBarContainer", "seekBarFill", "seekBarHandle",
+      "volumeControl", "volumeBtn", "volumeOnIcon", "volumeMutedIcon", "volumeBarContainer", "volumeBarFill", "volumeBarHandle",
+      "fullscreenBtn", "enterFullscreenIcon", "exitFullscreenIcon",
       "fileInput",
       "existingDialogOverlay", "existingFileName", "useExistingBtn", "rescanBtn",
       "transcodeWarningOverlay", "transcodeWarningTitle", "transcodeReasonText", "transcodeFileName",
@@ -120,8 +139,15 @@
     });
 
     els.video.addEventListener("timeupdate", onVideoTimeUpdate);
-    els.video.addEventListener("pause", () => maybePersistState(true));
+    els.video.addEventListener("play", () => updatePlayerControls(els.video.currentTime));
+    els.video.addEventListener("pause", () => {
+      updatePlayerControls(els.video.currentTime);
+      maybePersistState(true);
+    });
     els.video.addEventListener("seeked", () => maybePersistState(true));
+
+    wirePlayerControls();
+
     window.addEventListener("beforeunload", () => maybePersistState(true));
     document.addEventListener("visibilitychange", () => {
       if (document.hidden) maybePersistState(true);
@@ -501,6 +527,7 @@
   async function finalizeAndLoadPlayer(file, handle, record, resumeTime, resumePaused, audioAlreadyOk) {
     let finalFile = file;
     let finalHandle = handle;
+    let useMediabunny = false;
 
     if (!audioAlreadyOk) {
       let result = { ok: true };
@@ -510,29 +537,46 @@
         console.warn("Playability check failed before loading player, proceeding without an audio fix.", e);
       }
       if (!result.ok) {
-        const confirmed = await showTranscodeWarningDialog(file.name, true);
-        if (confirmed) {
-          const refreshedFile = await refreshFileHandle(file, handle);
-          const transcodeResult = await runTranscode(refreshedFile, true);
-          if (transcodeResult) {
-            finalFile = transcodeResult.file;
-            finalHandle = transcodeResult.handle;
-            record.transcoded = true;
-            // Only overwrite a previously-stored handle when we actually got a new one (the
-            // user picked a save location) — an in-memory-only result can't be silently
-            // re-opened after a reload anyway, so keeping the old handle (if any) around lets
-            // auto-resume still work, just re-offering this same fix next time.
-            if (finalHandle) record.fileHandle = finalHandle;
-            record.updatedAt = Date.now();
-            await VMDB.put("videos", record);
+        // Before asking the user to sit through an FFmpeg transcode, check whether
+        // mediabunny (js/mediabunny-player.js — canvas + Web Audio playback, with an AC3/
+        // E-AC-3 decoder extension) can just play the file as-is. For the common case this
+        // exists for — AC3/EAC3 audio Chrome has no native decoder for — this plays it
+        // directly in real time, no transcode needed at all. Only falls back to the
+        // transcode prompt if mediabunny can't handle it either.
+        let mediabunnyOk = false;
+        try {
+          mediabunnyOk = await VMMediabunnyPlayer.canPlay(file);
+        } catch (e) {
+          console.warn("Mediabunny playability check failed.", e);
+        }
+        if (mediabunnyOk) {
+          useMediabunny = true;
+        } else {
+          const confirmed = await showTranscodeWarningDialog(file.name, true);
+          if (confirmed) {
+            const refreshedFile = await refreshFileHandle(file, handle);
+            const transcodeResult = await runTranscode(refreshedFile, true);
+            if (transcodeResult) {
+              finalFile = transcodeResult.file;
+              finalHandle = transcodeResult.handle;
+              record.transcoded = true;
+              // Only overwrite a previously-stored handle when we actually got a new one
+              // (the user picked a save location) — an in-memory-only result can't be
+              // silently re-opened after a reload anyway, so keeping the old handle (if
+              // any) around lets auto-resume still work, just re-offering this same fix
+              // next time.
+              if (finalHandle) record.fileHandle = finalHandle;
+              record.updatedAt = Date.now();
+              await VMDB.put("videos", record);
+            }
+            // Failed/cancelled transcode: fall through and play the original (silent) file
+            // rather than stranding the user after a successful scan.
           }
-          // Failed/cancelled transcode: fall through and play the original (silent) file
-          // rather than stranding the user after a successful scan.
         }
       }
     }
 
-    await loadPlayerWithData(finalFile, finalHandle, record, resumeTime, resumePaused);
+    await loadPlayerWithData(finalFile, finalHandle, record, resumeTime, resumePaused, useMediabunny);
   }
 
   function updateScanProgress(pct) {
@@ -543,7 +587,7 @@
 
   // ---------- player ----------
 
-  async function loadPlayerWithData(file, handle, record, resumeTime, resumePaused) {
+  async function loadPlayerWithData(file, handle, record, resumeTime, resumePaused, useMediabunny) {
     activeVideo = {
       fileName: record.fileName,
       file,
@@ -553,18 +597,65 @@
       duration: record.duration,
       segments: VMScanner.mergeSegments(record.samples, settings.sensitivity, record.interval),
     };
+    updatePlayerControls(resumeTime || 0);
 
-    if (currentObjectUrl) URL.revokeObjectURL(currentObjectUrl);
-    currentObjectUrl = URL.createObjectURL(file);
-
-    els.fileNameLabel.textContent = record.fileName + (record.transcoded ? " (converted for playback)" : "");
-    // Hide any stale track list from a previous video immediately, rather than waiting for
-    // the browser to actually clear/repopulate audioTracks after the new src loads.
+    // Tear down whichever engine was serving a previous video before setting up this one.
+    if (mediabunnyPlayer) {
+      mediabunnyPlayer.destroy();
+      mediabunnyPlayer = null;
+    }
+    els.video.pause();
+    els.video.removeAttribute("src");
+    els.video.load();
+    els.video.classList.remove("blurred");
+    els.mediabunnyCanvas.classList.remove("blurred");
+    els.blurBadge.classList.add("hidden");
     els.audioTrackSelect.classList.add("hidden");
     els.audioTrackSelect.innerHTML = "";
+
+    els.fileNameLabel.textContent = record.fileName + (record.transcoded ? " (converted for playback)" : "");
+
+    activeEngine = useMediabunny ? "mediabunny" : "native";
+    els.video.classList.toggle("hidden", activeEngine === "mediabunny");
+    els.mediabunnyCanvas.classList.toggle("hidden", activeEngine !== "mediabunny");
+    showPlayerScreen();
+    showControlsTemporarily();
+
+    if (activeEngine === "mediabunny") {
+      try {
+        mediabunnyPlayer = await VMMediabunnyPlayer.create(els.mediabunnyCanvas, file, {
+          onTimeUpdate: handlePlaybackTimeUpdate,
+          onEnded: () => {},
+        });
+        applyVolumeToEngine(); // fresh player defaults to full volume internally otherwise
+        if (resumeTime) {
+          try {
+            await mediabunnyPlayer.setCurrentTime(Math.min(resumeTime, Math.max(0, mediabunnyPlayer.duration - 0.1)));
+          } catch (e) { /* ignore */ }
+        }
+        if (resumePaused === false) {
+          await mediabunnyPlayer.play();
+        }
+      } catch (e) {
+        // Passed its own canPlay() check but failed to actually set up — fall back to the
+        // native player rather than leaving the player screen blank with no video at all.
+        console.error("Mediabunny playback failed, falling back to the native player.", e);
+        activeEngine = "native";
+        els.mediabunnyCanvas.classList.add("hidden");
+        els.video.classList.remove("hidden");
+        loadNativeVideo(file, resumeTime, resumePaused);
+      }
+    } else {
+      loadNativeVideo(file, resumeTime, resumePaused);
+    }
+  }
+
+  function loadNativeVideo(file, resumeTime, resumePaused) {
+    if (currentObjectUrl) URL.revokeObjectURL(currentObjectUrl);
+    currentObjectUrl = URL.createObjectURL(file);
     els.video.src = currentObjectUrl;
     setBlur(false);
-    showPlayerScreen();
+    applyVolumeToEngine();
 
     els.video.addEventListener(
       "loadedmetadata",
@@ -593,9 +684,250 @@
   // viewer could perceive as an early/late blur.
   const BLUR_BOUNDARY_EPSILON = 0.05;
 
-  function onVideoTimeUpdate() {
+  // Engine-agnostic accessors — both playback engines end up driven through these, rather
+  // than each caller branching on activeEngine itself.
+  function isPausedNow() {
+    return activeEngine === "mediabunny" && mediabunnyPlayer ? mediabunnyPlayer.isPaused() : els.video.paused;
+  }
+
+  function currentPlaybackTime() {
+    return activeEngine === "mediabunny" && mediabunnyPlayer ? mediabunnyPlayer.getCurrentTime() : els.video.currentTime;
+  }
+
+  async function togglePlayPause() {
+    if (!activeVideo) return;
+    if (activeEngine === "mediabunny" && mediabunnyPlayer) {
+      if (mediabunnyPlayer.isPaused()) await mediabunnyPlayer.play(); else mediabunnyPlayer.pause();
+    } else if (els.video.paused) {
+      els.video.play().catch(() => {});
+    } else {
+      els.video.pause();
+    }
+    updatePlayerControls(currentPlaybackTime());
+    maybePersistState(true);
+  }
+
+  async function seekToFraction(fraction) {
+    if (!activeVideo || !activeVideo.duration) return;
+    await seekToTime(Math.max(0, Math.min(1, fraction)) * activeVideo.duration);
+  }
+
+  async function seekToTime(target) {
+    if (!activeVideo || !activeVideo.duration) return;
+    target = Math.max(0, Math.min(activeVideo.duration, target));
+    if (activeEngine === "mediabunny" && mediabunnyPlayer) {
+      await mediabunnyPlayer.setCurrentTime(target);
+    } else {
+      els.video.currentTime = target;
+    }
+    updatePlayerControls(target);
+    maybePersistState(true);
+  }
+
+  const SEEK_STEP_SECONDS = 5;
+
+  async function seekBy(deltaSeconds) {
+    await seekToTime(currentPlaybackTime() + deltaSeconds);
+  }
+
+  function formatControlTime(seconds) {
+    if (!isFinite(seconds) || seconds < 0) seconds = 0;
+    const m = Math.floor(seconds / 60);
+    const s = Math.floor(seconds % 60);
+    return `${m}:${String(s).padStart(2, "0")}`;
+  }
+
+  // Skipped while draggingProgressBar: the drag handlers in wirePlayerControls already paint
+  // a live preview of the seek position as the user drags, and this would otherwise fight
+  // that preview with the actual (not-yet-committed) playback position on every frame tick.
+  function updatePlayerControls(t) {
+    const duration = activeVideo ? activeVideo.duration : 0;
+    const paused = isPausedNow();
+    els.playIcon.classList.toggle("hidden", !paused);
+    els.pauseIcon.classList.toggle("hidden", paused);
+    els.playPauseBtn.setAttribute("aria-label", paused ? "Play" : "Pause");
+    if (!draggingProgressBar) {
+      els.currentTimeLabel.textContent = formatControlTime(t);
+      setSeekBarPosition(duration > 0 ? t / duration : 0);
+    }
+    els.durationLabel.textContent = formatControlTime(duration);
+  }
+
+  function setSeekBarPosition(fraction) {
+    const pct = Math.max(0, Math.min(100, fraction * 100));
+    els.seekBarFill.style.width = pct + "%";
+    els.seekBarHandle.style.left = pct + "%";
+  }
+
+  // ---------- player controls: show/hide, dragging, volume, fullscreen ----------
+  // Modeled on the mediabunny example player (https://mediabunny.dev/examples/media-player/):
+  // an overlay that appears on pointer movement over the player and fades out after a couple
+  // seconds of inactivity; draggable seek and volume bars that preview live and commit on
+  // release; clicking the video area itself (but not the controls) toggles play/pause.
+
+  function showControlsTemporarily() {
+    if (!activeVideo) return;
+    els.playerControls.classList.add("shown");
+    clearTimeout(hideControlsTimeout);
+    hideControlsTimeout = setTimeout(() => {
+      if (draggingProgressBar || draggingVolumeBar) return;
+      els.playerControls.classList.remove("shown");
+    }, 2000);
+  }
+
+  function hideControlsNow() {
+    if (draggingProgressBar || draggingVolumeBar) return;
+    clearTimeout(hideControlsTimeout);
+    els.playerControls.classList.remove("shown");
+  }
+
+  function applyVolumeToEngine() {
+    const actualVolume = volumeMuted ? 0 : volume;
+    if (activeEngine === "mediabunny" && mediabunnyPlayer) {
+      mediabunnyPlayer.setVolume(actualVolume);
+    } else {
+      // Squared for the same reason as mediabunny-player.js's setVolume: perceived loudness
+      // is roughly logarithmic, so a linear slider->volume mapping feels front-loaded.
+      els.video.volume = actualVolume ** 2;
+    }
+  }
+
+  function updateVolumeUI() {
+    const actualVolume = volumeMuted ? 0 : volume;
+    const pct = actualVolume * 100;
+    els.volumeBarFill.style.width = pct + "%";
+    els.volumeBarHandle.style.left = pct + "%";
+    els.volumeOnIcon.classList.toggle("hidden", actualVolume === 0);
+    els.volumeMutedIcon.classList.toggle("hidden", actualVolume !== 0);
+    els.volumeBtn.setAttribute("aria-label", actualVolume === 0 ? "Unmute" : "Mute");
+    applyVolumeToEngine();
+  }
+
+  function volumeFractionFromEvent(e) {
+    const rect = els.volumeBarContainer.getBoundingClientRect();
+    return Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
+  }
+
+  function seekFractionFromEvent(e) {
+    const rect = els.seekBarContainer.getBoundingClientRect();
+    return Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
+  }
+
+  function updateFullscreenIcon() {
+    const isFs = document.fullscreenElement === els.videoWrap;
+    els.enterFullscreenIcon.classList.toggle("hidden", isFs);
+    els.exitFullscreenIcon.classList.toggle("hidden", !isFs);
+    els.fullscreenBtn.setAttribute("aria-label", isFs ? "Exit fullscreen" : "Fullscreen");
+  }
+
+  function wirePlayerControls() {
+    els.playPauseBtn.addEventListener("click", () => { void togglePlayPause(); });
+
+    // Stops a click/drag anywhere in the controls from also being seen by videoWrap's
+    // click-to-toggle-play handler below (matching the reference player's behavior).
+    els.playerControls.addEventListener("click", (e) => {
+      e.stopPropagation();
+      showControlsTemporarily();
+    });
+
+    // --- seek bar: live preview while dragging, commits on release ---
+    els.seekBarContainer.addEventListener("pointerdown", (e) => {
+      if (!activeVideo || !activeVideo.duration) return;
+      draggingProgressBar = true;
+      try { els.seekBarContainer.setPointerCapture(e.pointerId); } catch (err) { /* ignore */ }
+      setSeekBarPosition(seekFractionFromEvent(e));
+      els.currentTimeLabel.textContent = formatControlTime(seekFractionFromEvent(e) * activeVideo.duration);
+      clearTimeout(hideControlsTimeout);
+    });
+    els.seekBarContainer.addEventListener("pointermove", (e) => {
+      if (!draggingProgressBar || !activeVideo) return;
+      const fraction = seekFractionFromEvent(e);
+      setSeekBarPosition(fraction);
+      els.currentTimeLabel.textContent = formatControlTime(fraction * activeVideo.duration);
+    });
+    els.seekBarContainer.addEventListener("pointerup", (e) => {
+      if (!draggingProgressBar) return;
+      draggingProgressBar = false;
+      try { els.seekBarContainer.releasePointerCapture(e.pointerId); } catch (err) { /* ignore */ }
+      void seekToFraction(seekFractionFromEvent(e));
+      showControlsTemporarily();
+    });
+
+    // --- volume bar: same live-preview-then-commit pattern, but volume applies instantly
+    // (no cost to "committing" continuously, unlike seeking) ---
+    els.volumeBarContainer.addEventListener("pointerdown", (e) => {
+      draggingVolumeBar = true;
+      try { els.volumeBarContainer.setPointerCapture(e.pointerId); } catch (err) { /* ignore */ }
+      volume = volumeFractionFromEvent(e);
+      volumeMuted = false;
+      updateVolumeUI();
+      clearTimeout(hideControlsTimeout);
+    });
+    els.volumeBarContainer.addEventListener("pointermove", (e) => {
+      if (!draggingVolumeBar) return;
+      volume = volumeFractionFromEvent(e);
+      updateVolumeUI();
+    });
+    els.volumeBarContainer.addEventListener("pointerup", (e) => {
+      if (!draggingVolumeBar) return;
+      draggingVolumeBar = false;
+      try { els.volumeBarContainer.releasePointerCapture(e.pointerId); } catch (err) { /* ignore */ }
+      showControlsTemporarily();
+    });
+    els.volumeBtn.addEventListener("click", () => {
+      volumeMuted = !volumeMuted;
+      updateVolumeUI();
+    });
+
+    // --- fullscreen ---
+    els.fullscreenBtn.addEventListener("click", () => {
+      if (document.fullscreenElement) {
+        document.exitFullscreen().catch(() => {});
+      } else {
+        els.videoWrap.requestFullscreen().catch((e) => console.error("Failed to enter fullscreen.", e));
+      }
+    });
+    document.addEventListener("fullscreenchange", updateFullscreenIcon);
+
+    // --- show/hide overlay on hover, click-video-to-toggle-play ---
+    els.videoWrap.addEventListener("pointermove", (e) => {
+      if (e.pointerType !== "touch") showControlsTemporarily();
+    });
+    els.videoWrap.addEventListener("pointerleave", () => hideControlsNow());
+    els.videoWrap.addEventListener("click", () => {
+      if (!activeVideo) return;
+      void togglePlayPause();
+      showControlsTemporarily();
+    });
+
+    // --- left/right arrow keys: rewind/advance 5s (matches the mediabunny example) ---
+    window.addEventListener("keydown", (e) => {
+      if (!activeVideo || els.playerScreen.classList.contains("hidden")) return;
+      // Don't hijack arrow keys away from a focused form control (e.g. the sensitivity
+      // slider in Settings, which is itself arrow-key-operable).
+      const tag = document.activeElement && document.activeElement.tagName;
+      if (tag === "INPUT" || tag === "SELECT" || tag === "TEXTAREA") return;
+
+      if (e.code === "ArrowLeft") {
+        void seekBy(-SEEK_STEP_SECONDS);
+      } else if (e.code === "ArrowRight") {
+        void seekBy(SEEK_STEP_SECONDS);
+      } else {
+        return;
+      }
+      showControlsTemporarily();
+      e.preventDefault();
+    });
+
+    updateVolumeUI();
+  }
+
+  // Shared between both playback engines: the native <video>'s "timeupdate" event calls this
+  // with els.video.currentTime (see onVideoTimeUpdate below); the mediabunny engine has no
+  // native timeupdate event, so js/mediabunny-player.js's render loop calls this directly via
+  // the onTimeUpdate callback passed into VMMediabunnyPlayer.create().
+  function handlePlaybackTimeUpdate(t) {
     if (activeVideo) {
-      const t = els.video.currentTime;
       // "Blur in advance" pads both edges of a flagged scene by the same amount: blur turns
       // on this many seconds before it starts, and stays on this many seconds after it ends
       // — a scene detected as ending abruptly (e.g. right when nudity happens to leave frame)
@@ -608,11 +940,17 @@
       );
       setBlur(shouldBlur);
     }
+    updatePlayerControls(t);
     maybePersistState(false);
   }
 
+  function onVideoTimeUpdate() {
+    handlePlaybackTimeUpdate(els.video.currentTime);
+  }
+
   function setBlur(on) {
-    els.video.classList.toggle("blurred", on);
+    const surface = activeEngine === "mediabunny" ? els.mediabunnyCanvas : els.video;
+    surface.classList.toggle("blurred", on);
     els.blurBadge.classList.toggle("hidden", !on);
   }
 
@@ -657,8 +995,8 @@
     if (!force && now - lastPersistAt < 2000) return;
     lastPersistAt = now;
     const fileName = activeVideo.fileName;
-    const currentTime = els.video.currentTime;
-    const paused = els.video.paused;
+    const currentTime = currentPlaybackTime();
+    const paused = isPausedNow();
     VMDB.get("videos", fileName).then((record) => {
       if (!record) return;
       record.lastCurrentTime = currentTime;

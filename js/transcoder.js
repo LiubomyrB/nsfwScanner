@@ -60,11 +60,7 @@
 
   async function getFFmpeg(onStatus) {
     if (!isCrossOriginIsolated()) {
-      throw new Error(
-        "This page is not cross-origin isolated (missing Cross-Origin-Opener-Policy / " +
-        "Cross-Origin-Embedder-Policy response headers), so the multithreaded FFmpeg engine " +
-        "cannot start in this browser session."
-      );
+      throw new Error(global.VMI18n.t("transcode.notCrossOriginIsolated"));
     }
     const [{ FFmpeg }, { toBlobURL }] = await loadModules();
     if (ffmpegInstance && ffmpegInstance.loaded) return ffmpegInstance;
@@ -78,7 +74,7 @@
         }
       });
     }
-    if (onStatus) onStatus("Downloading FFmpeg engine…");
+    if (onStatus) onStatus(global.VMI18n.t("transcode.statusDownloadingEngine"));
     await ffmpegInstance.load({
       // No classWorkerURL needed: since @ffmpeg/ffmpeg is now loaded from a same-origin
       // vendored path (see header comment), its default `new Worker(new URL("./worker.js",
@@ -237,11 +233,11 @@
 
     try {
       if (inputMode === "workerfs") {
-        if (onStatus) onStatus("Mounting video file…");
+        if (onStatus) onStatus(global.VMI18n.t("transcode.statusMounting"));
         await ffmpeg.createDir(mountPoint);
         await ffmpeg.mount("WORKERFS", { files: [file] }, mountPoint);
       } else {
-        if (onStatus) onStatus("Loading video into FFmpeg (MEMFS)…");
+        if (onStatus) onStatus(global.VMI18n.t("transcode.statusLoadingMemfs"));
         const [, { fetchFile }] = await loadModules();
         await ffmpeg.writeFile(inputName, await fetchFile(file));
       }
@@ -254,7 +250,7 @@
       if (onStatus) onStatus(processingMessage);
       const ret = await ffmpeg.exec(buildArgs(inputName, outputName));
       if (ret !== 0) {
-        throw new Error("FFmpeg exited with a non-zero status (" + ret + ").");
+        throw new Error(global.VMI18n.t("transcode.nonZeroExit", { code: ret }));
       }
 
       // opts.saveHandle (a FileSystemFileHandle the caller already got via
@@ -370,7 +366,7 @@
       "output.mp4",
       baseName(file.name) + ".mp4",
       "video/mp4",
-      "Transcoding to MP4 (H.264/AAC)…",
+      global.VMI18n.t("transcode.statusFull"),
       opts
     );
   }
@@ -412,7 +408,7 @@
       "output" + inputExt,
       baseName(file.name) + inputExt,
       file.type || "",
-      "Converting audio track (video left untouched)…",
+      global.VMI18n.t("transcode.statusAudioOnly"),
       opts
     );
   }

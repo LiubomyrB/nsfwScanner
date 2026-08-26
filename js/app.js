@@ -1,6 +1,7 @@
 // @ts-nocheck — plain multi-file classic-script app; globals (VMDB/VMScanner/VMTranscoder/tf/nsfwjs) are wired via <script> load order, not modules.
 (function () {
   const DEFAULT_SETTINGS = {
+    language: "uk",
     sensitivity: 0.5,
     blurAdvance: 1.5,
     rememberState: true,
@@ -26,6 +27,8 @@
   let pendingExisting = null;
   let pendingTranscodeResolve = null;
   let lastPersistAt = 0;
+  let pendingResumeRecord = null;
+  let pendingTranscodeWarningState = null;
   // "native" (plain <video>, the default/preferred path whenever it works) or "mediabunny"
   // (canvas + Web Audio playback via js/mediabunny-player.js — used only as a fallback for
   // files whose audio the browser can't decode natively but mediabunny can, e.g. AC3/E-AC-3,
@@ -49,6 +52,8 @@
     wireStaticUI();
 
     settings = await loadSettings();
+    VMI18n.setLanguage(settings.language);
+    VMI18n.applyToDom();
     applySettingsToInputs();
 
     if (settings.rememberState) {
@@ -58,7 +63,7 @@
 
   function cacheEls() {
     [
-      "settingsBtn", "openFileBtn", "timecodesBtn",
+      "settingsBtn", "openFileBtn", "timecodesBtn", "languageBtn", "languageBtnLabel",
       "startScreen", "pickFileBtn", "resumeBox", "resumeText", "resumeBtn", "resumeDismissBtn",
       "scanScreen", "scanProgressBar", "scanProgressText", "scanStatusText", "cancelScanBtn",
       "transcodeScreen", "transcodeProgressBar", "transcodeProgressText", "transcodeStatusText", "cancelTranscodeBtn",
@@ -68,7 +73,7 @@
       "volumeControl", "volumeBtn", "volumeOnIcon", "volumeMutedIcon", "volumeBarContainer", "volumeBarFill", "volumeBarHandle",
       "fullscreenBtn", "enterFullscreenIcon", "exitFullscreenIcon",
       "fileInput",
-      "existingDialogOverlay", "existingFileName", "useExistingBtn", "rescanBtn",
+      "existingDialogOverlay", "existingDialogText", "useExistingBtn", "rescanBtn",
       "timecodesDialogOverlay", "timecodesContent", "downloadTimecodesBtn", "downloadSubtitlesBtn", "closeTimecodesBtn",
       "assInfoDialogOverlay", "assInfoCloseX", "assInfoSaveBtn",
       "transcodeWarningOverlay", "transcodeWarningTitle", "transcodeReasonText", "transcodeFileName",
@@ -88,6 +93,15 @@
     els.closeSettingsBtn.addEventListener("click", closeSettingsDialog);
     els.settingsDialogOverlay.addEventListener("click", (e) => {
       if (e.target === els.settingsDialogOverlay) closeSettingsDialog();
+    });
+
+    els.languageBtn.addEventListener("click", () => {
+      const next = VMI18n.getLanguage() === "uk" ? "en" : "uk";
+      settings.language = next;
+      VMI18n.setLanguage(next);
+      VMI18n.applyToDom();
+      persistSettings();
+      refreshDynamicTexts();
     });
 
     els.timecodesBtn.addEventListener("click", openTimecodesDialog);
@@ -224,13 +238,14 @@
     const v = parseFloat(els.scanIntervalInput.value);
     const fineInterval = isFinite(v) && v >= 0.1 ? v : DEFAULT_SETTINGS.scanInterval;
     if (!els.adaptiveScanInput.checked) {
-      els.scanIntervalComputedHint.textContent = `Applied everywhere: every ${fineInterval}s.`;
+      els.scanIntervalComputedHint.textContent = VMI18n.t("settings.scanIntervalComputedSingle", { fine: fineInterval });
       return;
     }
     const coarseInterval = VMScanner.computeCoarseInterval(fineInterval);
-    els.scanIntervalComputedHint.textContent =
-      `1st pass (whole video): every ${coarseInterval.toFixed(2)}s. ` +
-      `2nd pass (regions it flags): every ${fineInterval}s.`;
+    els.scanIntervalComputedHint.textContent = VMI18n.t("settings.scanIntervalComputedBoth", {
+      coarse: coarseInterval.toFixed(2),
+      fine: fineInterval,
+    });
   }
 
   function openSettingsDialog() {
@@ -244,7 +259,7 @@
 
   function openTimecodesDialog() {
     if (!activeVideo) return;
-    els.timecodesContent.textContent = activeVideo.txtContent || "(no timecodes recorded for this scan)";
+    els.timecodesContent.textContent = activeVideo.txtContent || VMI18n.t("timecodesDialog.none");
     els.timecodesDialogOverlay.classList.remove("hidden");
   }
 
@@ -440,31 +455,32 @@
   }
 
   function showTranscodeWarningDialog(fileName, audioOnly) {
-    els.transcodeFileName.textContent = fileName;
-    if (audioOnly) {
-      els.transcodeWarningTitle.textContent = "Audio format not supported";
-      els.transcodeReasonText.textContent = "Your browser can play the video in";
-      els.transcodeReasonSuffix.textContent =
-        "but not its audio track (unsupported audio codec). Only the audio needs to be " +
-        "converted — the video stays untouched, so this should be quick — done locally in " +
-        "your browser using FFmpeg. Nothing is uploaded anywhere.";
-    } else {
-      els.transcodeWarningTitle.textContent = "Format not supported for playback";
-      els.transcodeReasonText.textContent = "Your browser can't play";
-      els.transcodeReasonSuffix.textContent =
-        "directly (unsupported container/codec). It can be converted to MP4 (H.264/AAC) " +
-        "locally in your browser using FFmpeg before scanning and playback. This runs " +
-        "entirely on your device — nothing is uploaded anywhere — but it can take a while " +
-        "for large files.";
-    }
+    pendingTranscodeWarningState = { fileName, audioOnly };
+    renderTranscodeWarningDialog();
     els.transcodeWarningOverlay.classList.remove("hidden");
     return new Promise((resolve) => {
       pendingTranscodeResolve = resolve;
     });
   }
 
+  function renderTranscodeWarningDialog() {
+    if (!pendingTranscodeWarningState) return;
+    const { fileName, audioOnly } = pendingTranscodeWarningState;
+    els.transcodeFileName.textContent = fileName;
+    if (audioOnly) {
+      els.transcodeWarningTitle.textContent = VMI18n.t("transcodeWarning.audioTitle");
+      els.transcodeReasonText.textContent = VMI18n.t("transcodeWarning.audioReason");
+      els.transcodeReasonSuffix.textContent = VMI18n.t("transcodeWarning.audioSuffix");
+    } else {
+      els.transcodeWarningTitle.textContent = VMI18n.t("transcodeWarning.videoTitle");
+      els.transcodeReasonText.textContent = VMI18n.t("transcodeWarning.videoReason");
+      els.transcodeReasonSuffix.textContent = VMI18n.t("transcodeWarning.videoSuffix");
+    }
+  }
+
   function hideTranscodeWarningDialog() {
     els.transcodeWarningOverlay.classList.add("hidden");
+    pendingTranscodeWarningState = null;
   }
 
   function resolveTranscodeDecision(confirmed) {
@@ -514,7 +530,7 @@
     } catch (e) {
       if (e && e.cancelled) return null;
       console.error(e);
-      alert("Video conversion failed: " + (e && e.message ? e.message : e));
+      alert(VMI18n.t("transcode.failed", { message: e && e.message ? e.message : e }));
       return null;
     }
   }
@@ -526,8 +542,8 @@
   }
 
   function showExistingDialog(fileName, onUseExisting, onRescan) {
-    els.existingFileName.textContent = fileName;
-    pendingExisting = { onUseExisting, onRescan };
+    pendingExisting = { fileName, onUseExisting, onRescan };
+    els.existingDialogText.textContent = VMI18n.t("existingDialog.text", { fileName });
     els.existingDialogOverlay.classList.remove("hidden");
   }
 
@@ -596,7 +612,7 @@
         return;
       }
       console.error(e);
-      alert("Scanning failed: " + (e && e.message ? e.message : e));
+      alert(VMI18n.t("scan.failed", { message: e && e.message ? e.message : e }));
       showStartScreen();
     }
   }
@@ -682,6 +698,7 @@
       // The full detected-scenes txt from scan time (REPORT_FLOOR-based — see startScan —
       // not sensitivity-filtered), shown/downloadable via the Timecodes dialog.
       txtContent: record.txtContent,
+      transcoded: !!record.transcoded,
     };
     updatePlayerControls(resumeTime || 0);
 
@@ -699,7 +716,7 @@
     els.audioTrackSelect.classList.add("hidden");
     els.audioTrackSelect.innerHTML = "";
 
-    els.fileNameLabel.textContent = record.fileName + (record.transcoded ? " (converted for playback)" : "");
+    updateFileNameLabel();
 
     activeEngine = useMediabunny ? "mediabunny" : "native";
     els.video.classList.toggle("hidden", activeEngine === "mediabunny");
@@ -845,7 +862,7 @@
     const showHours = shouldShowHours();
     els.playIcon.classList.toggle("hidden", !paused);
     els.pauseIcon.classList.toggle("hidden", paused);
-    els.playPauseBtn.setAttribute("aria-label", paused ? "Play" : "Pause");
+    els.playPauseBtn.setAttribute("aria-label", paused ? VMI18n.t("player.play") : VMI18n.t("player.pause"));
     if (!draggingProgressBar) {
       els.currentTimeLabel.textContent = formatControlTime(t, showHours);
       setSeekBarPosition(duration > 0 ? t / duration : 0);
@@ -899,7 +916,7 @@
     els.volumeBarHandle.style.left = pct + "%";
     els.volumeOnIcon.classList.toggle("hidden", actualVolume === 0);
     els.volumeMutedIcon.classList.toggle("hidden", actualVolume !== 0);
-    els.volumeBtn.setAttribute("aria-label", actualVolume === 0 ? "Unmute" : "Mute");
+    els.volumeBtn.setAttribute("aria-label", actualVolume === 0 ? VMI18n.t("player.unmute") : VMI18n.t("player.mute"));
     applyVolumeToEngine();
   }
 
@@ -917,7 +934,7 @@
     const isFs = document.fullscreenElement === els.videoWrap;
     els.enterFullscreenIcon.classList.toggle("hidden", isFs);
     els.exitFullscreenIcon.classList.toggle("hidden", !isFs);
-    els.fullscreenBtn.setAttribute("aria-label", isFs ? "Exit fullscreen" : "Fullscreen");
+    els.fullscreenBtn.setAttribute("aria-label", isFs ? VMI18n.t("player.exitFullscreen") : VMI18n.t("player.fullscreen"));
   }
 
   function wirePlayerControls() {
@@ -1059,6 +1076,11 @@
     handlePlaybackTimeUpdate(els.video.currentTime);
   }
 
+  function updateFileNameLabel() {
+    if (!activeVideo) return;
+    els.fileNameLabel.textContent = activeVideo.fileName + (activeVideo.transcoded ? VMI18n.t("player.convertedSuffix") : "");
+  }
+
   function setBlur(on) {
     const surface = activeEngine === "mediabunny" ? els.mediabunnyCanvas : els.video;
     surface.classList.toggle("blurred", on);
@@ -1083,7 +1105,10 @@
       const track = list[i];
       const opt = document.createElement("option");
       opt.value = track.id;
-      opt.textContent = track.label || (track.language ? `Track ${i + 1} (${track.language})` : `Track ${i + 1}`);
+      opt.textContent = track.label ||
+        (track.language
+          ? VMI18n.t("player.audioTrackNumberedLang", { n: i + 1, lang: track.language })
+          : VMI18n.t("player.audioTrackNumbered", { n: i + 1 }));
       if (track.enabled) opt.selected = true;
       els.audioTrackSelect.appendChild(opt);
     }
@@ -1156,7 +1181,11 @@
   }
 
   function showResumeBanner(record) {
-    els.resumeText.textContent = `Resume "${record.fileName}" from ${VMScanner.formatTime(record.lastCurrentTime || 0)}?`;
+    pendingResumeRecord = record;
+    els.resumeText.textContent = VMI18n.t("start.resumeText", {
+      fileName: record.fileName,
+      time: VMScanner.formatTime(record.lastCurrentTime || 0),
+    });
     els.resumeBox.classList.remove("hidden");
 
     els.resumeBtn.onclick = async () => {
@@ -1208,7 +1237,7 @@
     els.timecodesBtn.classList.add("hidden");
     els.scanProgressBar.style.width = "0%";
     els.scanProgressText.textContent = "0%";
-    els.scanStatusText.textContent = "Loading model…";
+    els.scanStatusText.textContent = VMI18n.t("scan.statusLoadingModel");
   }
 
   function showTranscodeScreen() {
@@ -1219,7 +1248,7 @@
     els.timecodesBtn.classList.add("hidden");
     els.transcodeProgressBar.style.width = "0%";
     els.transcodeProgressText.textContent = "0%";
-    els.transcodeStatusText.textContent = "Starting FFmpeg…";
+    els.transcodeStatusText.textContent = VMI18n.t("transcode.statusStarting");
   }
 
   function showPlayerScreen() {
@@ -1230,6 +1259,37 @@
     els.resumeBox.classList.add("hidden");
     els.openFileBtn.classList.remove("hidden");
     els.timecodesBtn.classList.remove("hidden");
+  }
+
+  // ---------- language switching ----------
+
+  // Re-renders every currently-visible piece of UI whose text was set by JS (rather than
+  // picked up automatically by VMI18n.applyToDom() from a static data-i18n attribute) —
+  // called right after the language toggle switches VMI18n's current language.
+  function refreshDynamicTexts() {
+    updateScanIntervalComputedHint();
+    if (activeVideo) {
+      updatePlayerControls(currentPlaybackTime());
+      updateVolumeUI();
+      updateFullscreenIcon();
+      updateFileNameLabel();
+      renderAudioTracks();
+    }
+    if (activeVideo && !els.timecodesDialogOverlay.classList.contains("hidden")) {
+      els.timecodesContent.textContent = activeVideo.txtContent || VMI18n.t("timecodesDialog.none");
+    }
+    if (pendingExisting && !els.existingDialogOverlay.classList.contains("hidden")) {
+      els.existingDialogText.textContent = VMI18n.t("existingDialog.text", { fileName: pendingExisting.fileName });
+    }
+    if (!els.transcodeWarningOverlay.classList.contains("hidden")) {
+      renderTranscodeWarningDialog();
+    }
+    if (pendingResumeRecord && !els.resumeBox.classList.contains("hidden")) {
+      els.resumeText.textContent = VMI18n.t("start.resumeText", {
+        fileName: pendingResumeRecord.fileName,
+        time: VMScanner.formatTime(pendingResumeRecord.lastCurrentTime || 0),
+      });
+    }
   }
 
   // ---------- helpers ----------

@@ -80,7 +80,7 @@
   // different wording so the status text doesn't say "confirming" when nothing is actually
   // being confirmed.
   function getWorkerPool(kind, onStatus, roleLabel) {
-    const label = roleLabel || (kind === "nudenet" ? "confirmation" : "scan");
+    const roleKey = roleLabel || (kind === "nudenet" ? "confirmation" : "scan");
     if (!pools[kind]) {
       // A worker that never reports readiness (stuck CDN fetch, transient network failure,
       // etc.) would otherwise hang the whole scan silently forever — so each worker gets a
@@ -88,7 +88,7 @@
       const startupTimeoutMs = kind === "nudenet" ? 90000 : 45000;
       pools[kind] = (async () => {
         const size = poolSizeFor(kind);
-        if (onStatus) onStatus(`Starting ${size} ${label} worker${size > 1 ? "s" : ""}…`);
+        if (onStatus) onStatus(VMI18n.t("scan.statusStartingWorkers", { count: size, role: VMI18n.t("scan.workerRole." + roleKey) }));
         const entries = Array.from({ length: size }, () => ({ worker: new Worker(WORKER_URLS[kind]) }));
         try {
           await Promise.all(
@@ -129,7 +129,7 @@
         }
         if (onStatus) {
           const backend = entries[0] && entries[0].backend;
-          onStatus(`Using ${size} ${label} worker${size > 1 ? "s" : ""} (${backend})…`);
+          onStatus(VMI18n.t("scan.statusUsingWorkers", { count: size, role: VMI18n.t("scan.workerRole." + roleKey), backend }));
         }
         return entries;
       })();
@@ -340,7 +340,7 @@
     // this way: 0.1s fine interval produced a 1.5s coarse pass regardless.
     const coarseInterval = computeCoarseInterval(fineInterval);
 
-    if (opts.onStatus) opts.onStatus("Scanning (coarse pass)…");
+    if (opts.onStatus) opts.onStatus(VMI18n.t("scan.statusCoarsePass"));
     const coarseTimes = buildUniformTimes(duration, coarseInterval);
     let coarseDone = 0;
     const coarseSamples = await sampleAtTimes(video, coarseTimes, pool, captureFn, classifyFn, {
@@ -375,7 +375,7 @@
       return coarseSamples;
     }
 
-    if (opts.onStatus) opts.onStatus(`Refining ${merged.length} detected region${merged.length > 1 ? "s" : ""}…`);
+    if (opts.onStatus) opts.onStatus(VMI18n.t("scan.statusRefining", { count: merged.length }));
     const fineTimesSet = new Set();
     for (const w of merged) {
       for (let t = w.start; t <= w.end; t += fineInterval) fineTimesSet.add(+t.toFixed(3));
@@ -554,10 +554,10 @@
 
     if (opts.onStatus) {
       const skipped = candidates.length - toConfirmCount;
-      opts.onStatus(
-        `Confirming ${toConfirmCount} region${toConfirmCount > 1 ? "s" : ""} with body-part detector` +
-        (skipped > 0 ? ` (${skipped} nearby sample${skipped > 1 ? "s" : ""} reused from neighbors)…` : "…")
-      );
+      const suffix = skipped > 0
+        ? VMI18n.t("scan.confirmingSkippedSuffix", { count: skipped })
+        : VMI18n.t("scan.confirmingNoSkippedSuffix");
+      opts.onStatus(VMI18n.t("scan.statusConfirming", { count: toConfirmCount, suffix }));
     }
     const pool = await getWorkerPool("nudenet", opts.onStatus, "confirmation");
     const verdicts = await classifyRunsWithDedup(video, captureFn, pool, classifyNudeNetAsProbability, runs, opts);
@@ -609,7 +609,7 @@
     const pool = usesNudeNetPrimary
       ? await getWorkerPool("nudenet", onStatus, "detector")
       : await getWorkerPool("nsfw", onStatus, "scan");
-    if (onStatus) onStatus("Preparing video…");
+    if (onStatus) onStatus(VMI18n.t("scan.statusPreparingVideo"));
 
     const url = URL.createObjectURL(file);
     const video = document.createElement("video");
@@ -672,7 +672,7 @@
             token, onProgress: primaryProgress, onStatus, sensitivity, dedupFinePass: !exactTiming,
           });
         } else {
-          if (onStatus) onStatus("Scanning frames with body-part detector…");
+          if (onStatus) onStatus(VMI18n.t("scan.statusScanningFramesNudenet"));
           samples = await scanUniform(video, nudenetCaptureFn, duration, interval, pool, classifyNudeNetAsProbability, {
             token, onProgress: primaryProgress,
           });
@@ -681,7 +681,7 @@
         if (adaptive) {
           samples = await scanAdaptive(video, nsfwCaptureFn, duration, interval, pool, classifyNSFW, { token, onProgress: primaryProgress, onStatus, sensitivity });
         } else {
-          if (onStatus) onStatus("Scanning frames…");
+          if (onStatus) onStatus(VMI18n.t("scan.statusScanningFrames"));
           samples = await scanUniform(video, nsfwCaptureFn, duration, interval, pool, classifyNSFW, { token, onProgress: primaryProgress });
         }
 

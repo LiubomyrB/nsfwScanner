@@ -48,8 +48,6 @@
     { layer: 1, style: "Ornament", draw: "m 1782 640 l 1782 945 l 1785 945 l 1785 640" },
 ];
 
-  const INTERTITLE_TEXT = "Censored scene";
-
   function formatAssTime(seconds) {
     seconds = Math.max(0, seconds);
     const totalCentiseconds = Math.round(seconds * 100);
@@ -157,7 +155,8 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
       for (const shape of scaledShapes) {
         lines.push(`Dialogue: ${shape.layer},${start},${end},${shape.style},,0,0,0,,{\\an7\\pos(0,0)\\p1}${shape.draw}{\\p0}`);
       }
-      lines.push(`Dialogue: 10,${start},${end},Intertitle,,0,0,0,,{\\an5\\pos(${centerX},${centerY})}${INTERTITLE_TEXT}`);
+      const intertitleText = (global.VMI18n && global.VMI18n.t("intertitle.text")) || "Censored scene";
+      lines.push(`Dialogue: 10,${start},${end},Intertitle,,0,0,0,,{\\an5\\pos(${centerX},${centerY})}${intertitleText}`);
     }
 
     return header + lines.join("\n") + "\n";

@@ -137,7 +137,26 @@
     <pre id="timecodesContent" class="timecodes-content"></pre>
     <div class="dialog-actions">
       <button id="downloadTimecodesBtn" class="btn primary">Download</button>
+      <button id="downloadSubtitlesBtn" class="btn">Download as subtitles</button>
       <button id="closeTimecodesBtn" class="btn">Close</button>
+    </div>
+  </div>
+</div>
+
+<!-- Explains where to save the .ass file before actually triggering the save flow -->
+<div id="assInfoDialogOverlay" class="dialog-overlay hidden">
+  <div class="dialog" role="dialog" aria-modal="true">
+    <div class="dialog-header-row">
+      <h3>Save subtitle file</h3>
+      <button id="assInfoCloseX" class="close-x" type="button" aria-label="Close">&times;</button>
+    </div>
+    <p>When you click "Save", pick the <strong>same folder where the video file is
+      located</strong>, and keep the suggested file name. Most media players automatically
+      load a subtitle file with the same name as the video, sitting next to it — once saved
+      there, this subtitle will automatically cover the screen when a detected scene plays,
+      even outside this app.</p>
+    <div class="dialog-actions">
+      <button id="assInfoSaveBtn" class="btn primary">Save</button>
     </div>
   </div>
 </div>
@@ -256,6 +275,7 @@
 <script src="js/scanner.js"></script>
 <script src="js/transcoder.js"></script>
 <script src="js/mediabunny-player.js"></script>
+<script src="js/ass-export.js"></script>
 <script src="js/app.js"></script>
 </body>
 </html>

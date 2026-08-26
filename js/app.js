@@ -69,7 +69,8 @@
       "fullscreenBtn", "enterFullscreenIcon", "exitFullscreenIcon",
       "fileInput",
       "existingDialogOverlay", "existingFileName", "useExistingBtn", "rescanBtn",
-      "timecodesDialogOverlay", "timecodesContent", "downloadTimecodesBtn", "closeTimecodesBtn",
+      "timecodesDialogOverlay", "timecodesContent", "downloadTimecodesBtn", "downloadSubtitlesBtn", "closeTimecodesBtn",
+      "assInfoDialogOverlay", "assInfoCloseX", "assInfoSaveBtn",
       "transcodeWarningOverlay", "transcodeWarningTitle", "transcodeReasonText", "transcodeFileName",
       "transcodeReasonSuffix", "transcodeConfirmBtn", "transcodeCancelBtn",
       "settingsDialogOverlay", "sensitivityInput", "sensitivityValue", "blurAdvanceInput",
@@ -99,9 +100,25 @@
       downloadTxt(activeVideo.txtContent || "", baseName(activeVideo.fileName) + "_timecodes.txt");
     });
 
+    els.downloadSubtitlesBtn.addEventListener("click", () => {
+      if (!activeVideo) return;
+      closeTimecodesDialog();
+      els.assInfoDialogOverlay.classList.remove("hidden");
+    });
+    els.assInfoCloseX.addEventListener("click", closeAssInfoDialog);
+    els.assInfoDialogOverlay.addEventListener("click", (e) => {
+      if (e.target === els.assInfoDialogOverlay) closeAssInfoDialog();
+    });
+    els.assInfoSaveBtn.addEventListener("click", () => {
+      closeAssInfoDialog();
+      void saveAssSubtitles();
+    });
+
     document.addEventListener("keydown", (e) => {
       if (e.key !== "Escape") return;
-      if (!els.timecodesDialogOverlay.classList.contains("hidden")) {
+      if (!els.assInfoDialogOverlay.classList.contains("hidden")) {
+        closeAssInfoDialog();
+      } else if (!els.timecodesDialogOverlay.classList.contains("hidden")) {
         closeTimecodesDialog();
       } else if (!els.settingsDialogOverlay.classList.contains("hidden")) {
         closeSettingsDialog();
@@ -233,6 +250,44 @@
 
   function closeTimecodesDialog() {
     els.timecodesDialogOverlay.classList.add("hidden");
+  }
+
+  function closeAssInfoDialog() {
+    els.assInfoDialogOverlay.classList.add("hidden");
+  }
+
+  // The actual pixel dimensions of the currently-playing frame — needed for the ASS file's
+  // PlayResX/PlayResY (see js/ass-export.js) — sourced from whichever engine is active, since
+  // native <video> and the mediabunny <canvas> expose it differently.
+  function getVideoDimensions() {
+    if (activeEngine === "mediabunny") {
+      return { width: els.mediabunnyCanvas.width, height: els.mediabunnyCanvas.height };
+    }
+    return { width: els.video.videoWidth, height: els.video.videoHeight };
+  }
+
+  async function saveAssSubtitles() {
+    if (!activeVideo) return;
+    const { width, height } = getVideoDimensions();
+    const assContent = VMAssExport.generate(width, height, activeVideo.segments, settings.blurAdvance || 0);
+    const suggestedName = baseName(activeVideo.fileName) + ".ass";
+
+    if (window.showSaveFilePicker) {
+      try {
+        const handle = await window.showSaveFilePicker({
+          suggestedName,
+          types: [{ description: "Subtitles", accept: { "text/plain": [".ass"] } }],
+        });
+        const writable = await handle.createWritable();
+        await writable.write(assContent);
+        await writable.close();
+        return;
+      } catch (e) {
+        if (e && e.name === "AbortError") return; // user cancelled the save dialog
+        console.warn("Save-location picker failed, falling back to a plain download.", e);
+      }
+    }
+    downloadTxt(assContent, suggestedName);
   }
 
   function onSensitivityChange(e) {

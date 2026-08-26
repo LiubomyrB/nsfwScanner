@@ -41,6 +41,13 @@
   // exactly 0) and collapse the whole video into one meaningless segment.
   const REPORT_FLOOR = 0.05;
 
+  // Mirrors nudenet-worker.js's own CONFIRM_LABELS — the 5 body-part classes a per-sample
+  // classScores map (see nudenet-worker.js's detect()) can carry a score for. Duplicated
+  // here rather than shared across the worker/main-thread boundary (this classic-script app
+  // has no module system to share a constant through) — keep both lists in sync if either
+  // changes.
+  const CONFIRM_LABELS = ["female-breast-bare", "female-vagina", "male-penis", "anus-bare", "buttocks-bare"];
+
   // Resolve the worker scripts relative to *this script's* own location (same reasoning as
   // transcoder.js's vendored-module path) so it keeps working regardless of what directory
   // index.html is served from.
@@ -156,18 +163,27 @@
   }
 
   function classifyNSFW(pool, bitmap) {
-    return dispatchToPool("nsfw", pool, { bitmap }, [bitmap]).then((r) => ({ probability: r.probability }));
+    return dispatchToPool("nsfw", pool, { bitmap }, [bitmap]).then((r) => ({ probability: r.probability, label: r.label }));
   }
 
   function classifyNudeNet(pool, bitmap) {
     return dispatchToPool("nudenet", pool, { bitmap, minScore: 0.2 }, [bitmap])
-      .then((r) => ({ matched: r.matched, maxScore: r.maxScore }));
+      .then((r) => ({ matched: r.matched, maxScore: r.maxScore, label: r.label, classScores: r.classScores }));
   }
 
-  // Same shape as classifyNSFW ({probability}), for code paths that use NudeNet as a
-  // primary/standalone classifier rather than a confirmation step.
+  // Same shape as classifyNSFW ({probability, label}), for code paths that use NudeNet as a
+  // primary/standalone classifier rather than a confirmation step. `label` (the specific
+  // body-part class NudeNet matched, e.g. "female-breast-bare") is only meaningful when
+  // something was actually matched — left undefined otherwise, same as classifyNSFW leaves
+  // it undefined for nothing-interesting frames it never even attempts a label for.
+  // `classScores` (per-class max score, 0 for classes with nothing detected) is always
+  // present regardless of `matched` — it's what applyClassThresholds re-filters samples by.
   function classifyNudeNetAsProbability(pool, bitmap) {
-    return classifyNudeNet(pool, bitmap).then((r) => ({ probability: r.matched ? r.maxScore : 0 }));
+    return classifyNudeNet(pool, bitmap).then((r) => ({
+      probability: r.matched ? r.maxScore : 0,
+      label: r.matched ? r.label : undefined,
+      classScores: r.classScores,
+    }));
   }
 
   function createCancelToken() {
@@ -509,14 +525,14 @@
         if (opts.onProgress) opts.onProgress(Math.min(100, (done / times.length) * 100));
       },
     });
-    const classifiedByTime = new Map(classified.map((c) => [c.time, c.probability]));
+    const classifiedByTime = new Map(classified.map((c) => [c.time, { probability: c.probability, label: c.label, classScores: c.classScores }]));
 
     const result = [];
     for (const run of runs) {
       const knownTimesInRun = run.map((s) => s.time).filter((t) => classifiedByTime.has(t));
       for (const s of run) {
-        let probability = classifiedByTime.get(s.time);
-        if (probability === undefined) {
+        let entry = classifiedByTime.get(s.time);
+        if (entry === undefined) {
           let nearestTime = null;
           let nearestDist = Infinity;
           for (const t of knownTimesInRun) {
@@ -526,9 +542,9 @@
               nearestTime = t;
             }
           }
-          probability = nearestTime !== null ? classifiedByTime.get(nearestTime) : 0;
+          entry = nearestTime !== null ? classifiedByTime.get(nearestTime) : { probability: 0, label: undefined, classScores: undefined };
         }
-        result.push({ time: s.time, probability });
+        result.push({ time: s.time, probability: entry.probability, label: entry.label, classScores: entry.classScores });
       }
     }
     return result;
@@ -561,11 +577,15 @@
     }
     const pool = await getWorkerPool("nudenet", opts.onStatus, "confirmation");
     const verdicts = await classifyRunsWithDedup(video, captureFn, pool, classifyNudeNetAsProbability, runs, opts);
-    const verdictByTime = new Map(verdicts.map((v) => [v.time, v.probability]));
+    const verdictByTime = new Map(verdicts.map((v) => [v.time, { probability: v.probability, label: v.label, classScores: v.classScores }]));
 
     const result = samples.map((s) => {
-      if (!verdictByTime.has(s.time)) return s;
-      return { time: s.time, probability: verdictByTime.get(s.time) };
+      const v = verdictByTime.get(s.time);
+      if (!v) return s;
+      // NudeNet's own class label/scores (specific body part, e.g. "female-breast-bare")
+      // replace whatever the NSFWJS primary pass had for this sample — it's the more
+      // precise verdict, being what actually decided this sample's confirmed probability.
+      return { time: s.time, probability: v.probability, label: v.label, classScores: v.classScores };
     });
     if (opts.onProgress) opts.onProgress(100);
     return result;
@@ -744,6 +764,32 @@
     return segments;
   }
 
+  // Recomputes each sample's usable `probability` from its per-class NudeNet scores (see
+  // nudenet-worker.js's classScores) and a set of per-class thresholds — the max score
+  // among classes that individually clear their own threshold in `classThresholds`, or 0
+  // ("not detected") if none do. This is how the app's per-class sensitivity sliders (see
+  // app.js) turn into an actual filter: a sample only counts at all if at least one of its
+  // detected body parts scores at or above that part's own slider, and the reported
+  // probability for what counts is that part's own score (not some other, filtered-out
+  // part's higher score). Samples with no classScores (NSFWJS-only samples, or scans from
+  // before this feature existed) pass through with their original scalar probability
+  // unchanged — there's no body-part breakdown on them to filter by. Returns a new array of
+  // plain {time, probability, label, classScores} samples, meant to be fed straight into
+  // mergeSegments in place of the raw samples.
+  function applyClassThresholds(samples, classThresholds) {
+    if (!samples) return [];
+    return samples.map((s) => {
+      if (!s.classScores) return s;
+      let best = 0;
+      for (const cls of CONFIRM_LABELS) {
+        const score = s.classScores[cls] || 0;
+        const threshold = (classThresholds && typeof classThresholds[cls] === "number") ? classThresholds[cls] : 0;
+        if (score >= threshold && score > best) best = score;
+      }
+      return { time: s.time, probability: best, label: s.label, classScores: s.classScores };
+    });
+  }
+
   function formatTime(totalSeconds) {
     const clamped = Math.max(0, totalSeconds || 0);
     const ms = Math.round((clamped % 1) * 1000);
@@ -772,11 +818,13 @@
   global.VMScanner = {
     scanVideoFile,
     mergeSegments,
+    applyClassThresholds,
     formatTime,
     computeCoarseInterval,
     segmentsToTxt,
     createCancelToken,
     getWorkerPool,
     REPORT_FLOOR,
+    CONFIRM_LABELS,
   };
 })(window);

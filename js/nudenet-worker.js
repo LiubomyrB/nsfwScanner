@@ -136,15 +136,26 @@ async function detect(session, bitmap, minScore) {
   const keep = nms(boxes, scores, 0.45);
 
   let maxConfirmScore = 0;
+  let maxConfirmLabel;
+  // Per-class max score (0 for a class this frame had nothing detected for) — lets callers
+  // (scanner.js's applyClassThresholds) filter/re-threshold each of the 5 confirm classes
+  // independently instead of only ever seeing one blended "matched" verdict.
+  const classScores = {};
+  for (const label of CONFIRM_LABELS) classScores[label] = 0;
   const parts = [];
   for (const i of keep) {
     const classId = classIds[i];
     if (CONFIRM_IDS.includes(classId)) {
-      parts.push({ score: scores[i], class: LABELS[classId] });
-      if (scores[i] > maxConfirmScore) maxConfirmScore = scores[i];
+      const label = LABELS[classId];
+      parts.push({ score: scores[i], class: label });
+      if (scores[i] > classScores[label]) classScores[label] = scores[i];
+      if (scores[i] > maxConfirmScore) {
+        maxConfirmScore = scores[i];
+        maxConfirmLabel = label;
+      }
     }
   }
-  return { matched: parts.length > 0, maxScore: maxConfirmScore, parts };
+  return { matched: parts.length > 0, maxScore: maxConfirmScore, label: maxConfirmLabel, classScores, parts };
 }
 
 self.onmessage = async (e) => {

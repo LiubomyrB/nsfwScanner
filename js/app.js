@@ -1,14 +1,40 @@
 // @ts-nocheck — plain multi-file classic-script app; globals (VMDB/VMScanner/VMTranscoder/tf/nsfwjs) are wired via <script> load order, not modules.
 (function () {
+  // The 5 NudeNet body-part classes a sample's classScores map can carry a score for (see
+  // nudenet-worker.js's CONFIRM_LABELS / scanner.js's applyClassThresholds) — each gets its
+  // own sensitivity slider, built dynamically (see buildClassThresholdSliders) into both the
+  // Settings dialog and the Timecodes dialog rather than hand-written 5x in each.
+  const CONFIRM_CLASSES = [
+    { key: "female-breast-bare", i18nKey: "settings.classFemaleBreastBare" },
+    { key: "female-vagina", i18nKey: "settings.classFemaleVagina" },
+    { key: "male-penis", i18nKey: "settings.classMalePenis" },
+    { key: "anus-bare", i18nKey: "settings.classAnusBare" },
+    { key: "buttocks-bare", i18nKey: "settings.classButtocksBare" },
+  ];
+
+  function defaultClassThresholds() {
+    const obj = {};
+    CONFIRM_CLASSES.forEach((c) => { obj[c.key] = 0; });
+    return obj;
+  }
+
   const DEFAULT_SETTINGS = {
     language: "uk",
     sensitivity: 0.5,
+    // Per-class re-thresholds on top of NudeNet's own per-part scores — see
+    // VMScanner.applyClassThresholds. 0 for every class by default: a sample counts as soon
+    // as NudeNet reported anything for a class at all, identical to behavior before this
+    // feature existed.
+    classThresholds: defaultClassThresholds(),
     blurAdvance: 1.5,
     rememberState: true,
     scanInterval: 0.2,
     adaptiveScan: true,
     // "nsfwjs": NSFWJS only. "confirm": NSFWJS scans, NudeNet double-checks what it flags.
     // "nudenet": NudeNet is the primary/only classifier for every sampled frame.
+    // NSFWJS-only/confirm modes are hidden from the Settings UI (NudeNet-only gives the
+    // per-class breakdown the class-threshold sliders need) but kept in code/settings in
+    // case that's revisited.
     detectionMode: "nudenet",
     // When NudeNet is involved (confirm/nudenet modes), classify every candidate/fine
     // sample individually instead of a few representatives with the rest propagated —
@@ -29,6 +55,10 @@
   let lastPersistAt = 0;
   let pendingResumeRecord = null;
   let pendingTranscodeWarningState = null;
+  // Set only when openTimecodesDialog is called right after a fresh scan finishes (see
+  // startScan) — shows a one-line "scanned in Xs, N scenes found" stats line at the top of
+  // the dialog in that case only, not when the user opens it manually via the toolbar button.
+  let lastScanStats = null;
   // "native" (plain <video>, the default/preferred path whenever it works) or "mediabunny"
   // (canvas + Web Audio playback via js/mediabunny-player.js — used only as a fallback for
   // files whose audio the browser can't decode natively but mediabunny can, e.g. AC3/E-AC-3,
@@ -74,11 +104,12 @@
       "fullscreenBtn", "enterFullscreenIcon", "exitFullscreenIcon",
       "fileInput",
       "existingDialogOverlay", "existingDialogText", "useExistingBtn", "rescanBtn",
-      "timecodesDialogOverlay", "timecodesContent", "downloadTimecodesBtn", "downloadSubtitlesBtn", "closeTimecodesBtn",
+      "timecodesDialogOverlay", "timecodesStats", "classThresholdsTimecodes", "timecodesContent",
+      "downloadTimecodesBtn", "downloadSubtitlesBtn", "closeTimecodesBtn",
       "assInfoDialogOverlay", "assInfoCloseX", "assInfoSaveBtn",
       "transcodeWarningOverlay", "transcodeWarningTitle", "transcodeReasonText", "transcodeFileName",
       "transcodeReasonSuffix", "transcodeConfirmBtn", "transcodeCancelBtn",
-      "settingsDialogOverlay", "sensitivityInput", "sensitivityValue", "blurAdvanceInput",
+      "settingsDialogOverlay", "sensitivityInput", "sensitivityValue", "classThresholdsSettings", "blurAdvanceInput",
       "scanIntervalInput", "scanIntervalComputedHint", "adaptiveScanInput", "rememberStateInput", "closeSettingsBtn",
       "modeNsfwjsInput", "modeConfirmInput", "modeNudenetInput", "nudenetExactTimingInput",
     ].forEach((id) => { els[id] = document.getElementById(id); });
@@ -86,6 +117,9 @@
   }
 
   function wireStaticUI() {
+    buildClassThresholdSliders(els.classThresholdsSettings);
+    buildClassThresholdSliders(els.classThresholdsTimecodes);
+
     els.pickFileBtn.addEventListener("click", () => pickVideoFile().then((picked) => picked && openFileFlow(picked.file, picked.handle)));
     els.openFileBtn.addEventListener("click", () => pickVideoFile().then((picked) => picked && openFileFlow(picked.file, picked.handle)));
 
@@ -104,14 +138,16 @@
       refreshDynamicTexts();
     });
 
-    els.timecodesBtn.addEventListener("click", openTimecodesDialog);
+    els.timecodesBtn.addEventListener("click", () => openTimecodesDialog());
     els.closeTimecodesBtn.addEventListener("click", closeTimecodesDialog);
     els.timecodesDialogOverlay.addEventListener("click", (e) => {
       if (e.target === els.timecodesDialogOverlay) closeTimecodesDialog();
     });
     els.downloadTimecodesBtn.addEventListener("click", () => {
       if (!activeVideo) return;
-      downloadTxt(activeVideo.txtContent || "", baseName(activeVideo.fileName) + "_timecodes.txt");
+      const segments = activeVideo.liveTimecodesSegments || [];
+      const txt = VMScanner.segmentsToTxt(segments, activeVideo.fileName);
+      downloadTxt(txt, baseName(activeVideo.fileName) + "_timecodes.txt");
     });
 
     els.downloadSubtitlesBtn.addEventListener("click", () => {
@@ -205,6 +241,12 @@
   async function loadSettings() {
     const s = await VMDB.get("settings", "app");
     const merged = Object.assign({}, DEFAULT_SETTINGS, s || {});
+    // Own object, not a shared reference to DEFAULT_SETTINGS.classThresholds (which a plain
+    // Object.assign would leave in place untouched whenever a persisted record predates this
+    // setting) — mutating settings.classThresholds later must never mutate the module-level
+    // default. Merged key-by-key so an older persisted record missing a class added later
+    // still gets that class's default (0) rather than `undefined`.
+    merged.classThresholds = Object.assign({}, DEFAULT_SETTINGS.classThresholds, (s && s.classThresholds) || {});
     // Migrate the old boolean setting (pre-"NudeNet only" mode) to the new 3-way mode.
     if (s && !("detectionMode" in s) && "nudeNetConfirm" in s) {
       merged.detectionMode = s.nudeNetConfirm ? "confirm" : "nsfwjs";
@@ -227,6 +269,71 @@
     els.nudenetExactTimingInput.checked = !!settings.nudenetExactTiming;
     els.rememberStateInput.checked = !!settings.rememberState;
     updateScanIntervalComputedHint();
+    syncClassThresholdInputs();
+  }
+
+  // key -> [{ input, valueEl }, ...] — one entry per dialog the sliders were built into
+  // (Settings + Timecodes), kept in sync with each other since they're the same setting.
+  const classThresholdInputs = {};
+
+  // Builds one range-slider <label class="field"> per CONFIRM_CLASSES entry into `container`
+  // (called once per dialog, at startup — see wireStaticUI) rather than hand-writing 5
+  // nearly-identical blocks x2 dialogs in index.html. Each slider's label carries its own
+  // data-i18n attribute, so VMI18n.applyToDom() (already run on every language switch) picks
+  // these up automatically without any extra wiring here.
+  function buildClassThresholdSliders(container) {
+    if (!container) return;
+    CONFIRM_CLASSES.forEach((cls) => {
+      const wrapper = document.createElement("label");
+      wrapper.className = "field";
+
+      const topRow = document.createElement("span");
+      const labelSpan = document.createElement("span");
+      labelSpan.setAttribute("data-i18n", cls.i18nKey);
+      labelSpan.textContent = VMI18n.t(cls.i18nKey);
+      const valueB = document.createElement("b");
+      topRow.appendChild(labelSpan);
+      topRow.appendChild(document.createTextNode(" "));
+      topRow.appendChild(valueB);
+
+      const input = document.createElement("input");
+      input.type = "range";
+      input.min = "0";
+      input.max = "1";
+      input.step = "0.01";
+
+      wrapper.appendChild(topRow);
+      wrapper.appendChild(input);
+      container.appendChild(wrapper);
+
+      input.addEventListener("input", () => onClassThresholdChange(cls.key, parseFloat(input.value)));
+
+      if (!classThresholdInputs[cls.key]) classThresholdInputs[cls.key] = [];
+      classThresholdInputs[cls.key].push({ input, valueEl: valueB });
+    });
+  }
+
+  // Pushes settings.classThresholds into every built slider instance (both dialogs) — called
+  // on load/dialog-open and after any single slider changes, so the Settings-dialog copy and
+  // the Timecodes-dialog copy of the same 5 sliders never drift apart from each other.
+  function syncClassThresholdInputs() {
+    CONFIRM_CLASSES.forEach((cls) => {
+      const value = settings.classThresholds[cls.key] || 0;
+      (classThresholdInputs[cls.key] || []).forEach(({ input, valueEl }) => {
+        input.value = value;
+        valueEl.textContent = value.toFixed(2);
+      });
+    });
+  }
+
+  function onClassThresholdChange(key, value) {
+    settings.classThresholds[key] = value;
+    persistSettings();
+    syncClassThresholdInputs();
+    recomputeActiveSegments();
+    if (activeVideo && !els.timecodesDialogOverlay.classList.contains("hidden")) {
+      renderTimecodesDialogContent();
+    }
   }
 
   // Shows the actual gap each pass of an adaptive scan will use, computed from whatever's
@@ -257,10 +364,46 @@
     els.settingsDialogOverlay.classList.add("hidden");
   }
 
-  function openTimecodesDialog() {
+  // `stats`, when passed, is { elapsedMs, sceneCount } from a scan that just finished — shows
+  // a stats line at the top of the dialog for that one appearance. Omit it (as the toolbar
+  // button's handler does) to open the dialog plain, same as before this feature existed.
+  function openTimecodesDialog(stats) {
     if (!activeVideo) return;
-    els.timecodesContent.textContent = activeVideo.txtContent || VMI18n.t("timecodesDialog.none");
+    lastScanStats = stats || null;
+    renderTimecodesDialogStats();
+    syncClassThresholdInputs();
+    renderTimecodesDialogContent();
     els.timecodesDialogOverlay.classList.remove("hidden");
+  }
+
+  // Recomputes the detected-scenes list shown in the Timecodes dialog from the raw samples,
+  // REPORT_FLOOR (not the general/blur sensitivity — this list is meant to show everything
+  // the scan found, same principle as startScan's own txt export) and the current per-class
+  // thresholds — called on open and again every time a class slider moves (see
+  // buildClassThresholdSliders' onChange). Cached on activeVideo.liveTimecodesSegments so the
+  // download/ASS-export buttons export exactly what's currently shown, not a stale snapshot.
+  function renderTimecodesDialogContent() {
+    if (!activeVideo) return;
+    const filtered = VMScanner.applyClassThresholds(activeVideo.samples, settings.classThresholds);
+    const segments = VMScanner.mergeSegments(filtered, VMScanner.REPORT_FLOOR, activeVideo.interval);
+    activeVideo.liveTimecodesSegments = segments;
+    const txt = segments.length ? VMScanner.segmentsToTxt(segments, activeVideo.fileName) : "";
+    els.timecodesContent.textContent = txt || VMI18n.t("timecodesDialog.none");
+  }
+
+  function renderTimecodesDialogStats() {
+    if (!lastScanStats) {
+      els.timecodesStats.textContent = "";
+      els.timecodesStats.classList.add("hidden");
+      return;
+    }
+    const seconds = lastScanStats.elapsedMs / 1000;
+    const duration = formatControlTime(seconds, seconds >= 3600);
+    els.timecodesStats.textContent = VMI18n.t("timecodesDialog.scanStats", {
+      count: lastScanStats.sceneCount,
+      duration,
+    });
+    els.timecodesStats.classList.remove("hidden");
   }
 
   function closeTimecodesDialog() {
@@ -284,7 +427,16 @@
   async function saveAssSubtitles() {
     if (!activeVideo) return;
     const { width, height } = getVideoDimensions();
-    const assContent = VMAssExport.generate(width, height, activeVideo.segments, settings.blurAdvance || 0);
+    // Same list as the Timecodes dialog is currently showing (REPORT_FLOOR + per-class
+    // thresholds), not the general-sensitivity-gated blur segments — the dialog's own
+    // "Download as subtitles" button is the only way to reach this, so
+    // liveTimecodesSegments is always populated by the time this runs.
+    const segments = activeVideo.liveTimecodesSegments || VMScanner.mergeSegments(
+      VMScanner.applyClassThresholds(activeVideo.samples, settings.classThresholds),
+      VMScanner.REPORT_FLOOR,
+      activeVideo.interval
+    );
+    const assContent = VMAssExport.generate(width, height, segments, settings.blurAdvance || 0);
     const suggestedName = baseName(activeVideo.fileName) + ".ass";
 
     if (window.showSaveFilePicker) {
@@ -351,7 +503,8 @@
 
   function recomputeActiveSegments() {
     if (!activeVideo) return;
-    activeVideo.segments = VMScanner.mergeSegments(activeVideo.samples, settings.sensitivity, activeVideo.interval);
+    const filtered = VMScanner.applyClassThresholds(activeVideo.samples, settings.classThresholds);
+    activeVideo.segments = VMScanner.mergeSegments(filtered, settings.sensitivity, activeVideo.interval);
   }
 
   // ---------- file picking ----------
@@ -566,6 +719,7 @@
     const keyName = originalName || file.name;
     showScanScreen();
     cancelToken = VMScanner.createCancelToken();
+    const scanStartedAt = Date.now();
     try {
       const { samples, duration, interval } = await VMScanner.scanVideoFile(file, {
         onProgress: updateScanProgress,
@@ -581,7 +735,14 @@
       // REPORT_FLOOR, not settings.sensitivity: the exported txt / stored record should
       // capture everything the scan actually found, independent of the (playback-only,
       // freely adjustable) sensitivity slider — see scanner.js's comment on REPORT_FLOOR.
-      const segments = VMScanner.mergeSegments(samples, VMScanner.REPORT_FLOOR, interval);
+      // Per-class thresholds DO apply here though (via applyClassThresholds) — same
+      // treatment the Timecodes dialog gives this list interactively (see
+      // renderTimecodesDialogContent), just using whatever the sliders are set to right now.
+      const segments = VMScanner.mergeSegments(
+        VMScanner.applyClassThresholds(samples, settings.classThresholds),
+        VMScanner.REPORT_FLOOR,
+        interval
+      );
       const txt = VMScanner.segmentsToTxt(segments, keyName);
       downloadTxt(txt, baseName(keyName) + "_timecodes.txt");
 
@@ -606,6 +767,7 @@
       await VMDB.put("meta", { id: "app", lastOpenedFileName: keyName });
 
       await finalizeAndLoadPlayer(file, handle, record, 0, true, audioAlreadyOk);
+      openTimecodesDialog({ elapsedMs: Date.now() - scanStartedAt, sceneCount: segments.length });
     } catch (e) {
       if (e && e.cancelled) {
         showStartScreen();
@@ -694,12 +856,14 @@
       samples: record.samples,
       interval: record.interval,
       duration: record.duration,
-      segments: VMScanner.mergeSegments(record.samples, settings.sensitivity, record.interval),
       // The full detected-scenes txt from scan time (REPORT_FLOOR-based — see startScan —
-      // not sensitivity-filtered), shown/downloadable via the Timecodes dialog.
+      // not sensitivity-filtered). No longer read by the Timecodes dialog (which now
+      // recomputes live — see renderTimecodesDialogContent) but kept as a record of what
+      // was found at scan time.
       txtContent: record.txtContent,
       transcoded: !!record.transcoded,
     };
+    recomputeActiveSegments();
     updatePlayerControls(resumeTime || 0);
 
     // Tear down whichever engine was serving a previous video before setting up this one.
@@ -1276,7 +1440,8 @@
       renderAudioTracks();
     }
     if (activeVideo && !els.timecodesDialogOverlay.classList.contains("hidden")) {
-      els.timecodesContent.textContent = activeVideo.txtContent || VMI18n.t("timecodesDialog.none");
+      renderTimecodesDialogContent();
+      renderTimecodesDialogStats();
     }
     if (pendingExisting && !els.existingDialogOverlay.classList.contains("hidden")) {
       els.existingDialogText.textContent = VMI18n.t("existingDialog.text", { fileName: pendingExisting.fileName });

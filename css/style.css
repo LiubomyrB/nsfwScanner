@@ -335,6 +335,10 @@ html, body {
 .dialog p { color: var(--dim); font-size: 14px; }
 
 .timecodes-dialog { width: min(560px, 92vw); }
+.timecodes-stats {
+  margin: -4px 0 12px;
+  color: var(--accent-hover);
+}
 .timecodes-content {
   background: var(--bg);
   border: 1px solid var(--border);
@@ -357,6 +361,26 @@ html, body {
   gap: 6px;
   margin: 16px 0;
   font-size: 14px;
+}
+.class-thresholds {
+  margin: 12px 0;
+  padding: 12px 14px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+}
+.class-thresholds-heading {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--dim);
+  text-transform: uppercase;
+  letter-spacing: .4px;
+  margin-bottom: 4px;
+}
+.class-thresholds .field {
+  margin: 10px 0;
+}
+.class-thresholds .field:first-of-type {
+  margin-top: 8px;
 }
 .field input[type="range"],
 .field input[type="number"] {

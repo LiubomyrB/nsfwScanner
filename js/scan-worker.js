@@ -64,13 +64,26 @@ function nudityScore(predictions) {
   return Math.min(1, score);
 }
 
+// NSFWJS is a whole-frame 5-way classifier (Drawing/Hentai/Neutral/Porn/Sexy), not an
+// object detector — there's no "part" to name like NudeNet's labels. The closest
+// equivalent "class that was detected" is simply whichever of the 5 classes this frame
+// scored highest on, saved alongside the probability so a sample's record shows what the
+// classifier actually thought the frame was, not just the derived nudity score.
+function topLabel(predictions) {
+  let best = predictions[0];
+  for (const p of predictions) {
+    if (p.probability > best.probability) best = p;
+  }
+  return best ? best.className : undefined;
+}
+
 self.onmessage = async (e) => {
   const { id, bitmap } = e.data;
   try {
     const { model, backend } = await getModel();
     const predictions = await model.classify(bitmap);
     bitmap.close();
-    self.postMessage({ id, ok: true, probability: nudityScore(predictions), backend });
+    self.postMessage({ id, ok: true, probability: nudityScore(predictions), label: topLabel(predictions), backend });
   } catch (err) {
     try { bitmap.close(); } catch (e2) { /* ignore */ }
     self.postMessage({ id, ok: false, error: String((err && err.message) || err) });

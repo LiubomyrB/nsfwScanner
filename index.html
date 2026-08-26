@@ -138,6 +138,12 @@
 <div id="timecodesDialogOverlay" class="dialog-overlay hidden">
   <div class="dialog timecodes-dialog" role="dialog" aria-modal="true">
     <h3 data-i18n="timecodesDialog.title">Timecodes</h3>
+    <p id="timecodesStats" class="hint timecodes-stats hidden"></p>
+    <div class="class-thresholds">
+      <div class="class-thresholds-heading" data-i18n="settings.classThresholdsHeading">Per-class sensitivity</div>
+      <div id="classThresholdsTimecodes"></div>
+      <p class="hint" data-i18n="timecodesDialog.classThresholdsHint">Adjust which body parts count as detected — the list below updates live, and these values are also used when exporting timecodes/subtitles.</p>
+    </div>
     <pre id="timecodesContent" class="timecodes-content"></pre>
     <div class="dialog-actions">
       <button id="downloadTimecodesBtn" class="btn primary" data-i18n="timecodesDialog.download">Download</button>
@@ -189,6 +195,12 @@
       <span class="hint" data-i18n="settings.sensitivityHint">Blur triggers only when detected probability is ≥ this value.</span>
     </label>
 
+    <div class="class-thresholds">
+      <div class="class-thresholds-heading" data-i18n="settings.classThresholdsHeading">Per-class sensitivity</div>
+      <div id="classThresholdsSettings"></div>
+      <p class="hint" data-i18n="settings.classThresholdsHint">Fine-tune sensitivity separately for each detected body part. A sample only counts as detected if at least one of these is met — the general sensitivity above then decides whether that counts as enough to blur.</p>
+    </div>
+
     <label class="field">
       <span data-i18n="settings.blurAdvance">Blur in advance (seconds)</span>
       <input type="number" id="blurAdvanceInput" min="0" step="0.1">
@@ -224,11 +236,11 @@
 
     <div class="field">
       <span data-i18n="settings.detectionMethod">Detection method</span>
-      <label class="checkbox-field">
+      <label class="checkbox-field hidden">
         <input type="radio" name="detectionMode" id="modeNsfwjsInput" value="nsfwjs">
         <span data-i18n="settings.modeNsfwjs">NSFWJS only (fastest)</span>
       </label>
-      <label class="checkbox-field">
+      <label class="checkbox-field hidden">
         <input type="radio" name="detectionMode" id="modeConfirmInput" value="confirm">
         <span data-i18n="settings.modeConfirm">NSFWJS + NudeNet confirmation (recommended)</span>
       </label>

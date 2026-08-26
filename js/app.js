@@ -1097,13 +1097,23 @@
         activeEngine = "native";
         els.mediabunnyCanvas.classList.add("hidden");
         els.video.classList.remove("hidden");
-        loadNativeVideo(file, resumeTime, resumePaused);
+        await loadNativeVideo(file, resumeTime, resumePaused);
       }
     } else {
-      loadNativeVideo(file, resumeTime, resumePaused);
+      await loadNativeVideo(file, resumeTime, resumePaused);
     }
   }
 
+  // Returns a Promise that resolves once the native <video>'s metadata has actually loaded
+  // (or its "error" event fires) — awaited by loadPlayerWithData so that, by the time it
+  // returns, els.video.videoWidth/videoHeight are reliably populated. Without this, code
+  // that runs right after loadPlayerWithData resolves (e.g. startScan opening the Timecodes
+  // dialog, whose snapshot grid needs real video dimensions via getVideoDimensions — see
+  // renderTimecodesSnapshotGrid) could read videoWidth/videoHeight as still 0, producing
+  // wildly wrong crop rectangles — reproduced directly: thumbnails were badly over-cropped
+  // only on the dialog's very first auto-open right after a scan, correct on every
+  // subsequent open (by which point metadata had long since loaded). The mediabunny engine
+  // branch above never had this problem since VMMediabunnyPlayer.create() is already awaited.
   function loadNativeVideo(file, resumeTime, resumePaused) {
     if (currentObjectUrl) URL.revokeObjectURL(currentObjectUrl);
     currentObjectUrl = URL.createObjectURL(file);
@@ -1111,9 +1121,13 @@
     setBlur(false);
     applyVolumeToEngine();
 
-    els.video.addEventListener(
-      "loadedmetadata",
-      () => {
+    return new Promise((resolve) => {
+      function finish() {
+        els.video.removeEventListener("loadedmetadata", onLoaded);
+        els.video.removeEventListener("error", onError);
+        resolve();
+      }
+      function onLoaded() {
         renderAudioTracks();
         if (resumeTime) {
           try {
@@ -1123,9 +1137,16 @@
         if (resumePaused === false) {
           els.video.play().catch(() => {});
         }
-      },
-      { once: true }
-    );
+        finish();
+      }
+      // Don't leave the caller hanging forever if metadata never loads — downstream code
+      // already tolerates videoWidth/videoHeight staying 0.
+      function onError() {
+        finish();
+      }
+      els.video.addEventListener("loadedmetadata", onLoaded, { once: true });
+      els.video.addEventListener("error", onError, { once: true });
+    });
   }
 
   // Two segments' blur windows can be meant to touch exactly (one segment's end equal to

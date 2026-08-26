@@ -141,21 +141,34 @@ async function detect(session, bitmap, minScore) {
   // (scanner.js's applyClassThresholds) filter/re-threshold each of the 5 confirm classes
   // independently instead of only ever seeing one blended "matched" verdict.
   const classScores = {};
-  for (const label of CONFIRM_LABELS) classScores[label] = 0;
+  // Per-class box ([cx, cy, w, h], in this INPUT_SIZE-square letterboxed pixel space — same
+  // space grabLetterboxBitmap drew the frame into) of whichever detection gave that class
+  // its max score — lets callers crop a snapshot of exactly what triggered the detection
+  // (see scanner.js's letterboxBoxToVideoFraction, which maps this space back to the real
+  // video frame once the actual video dimensions are known).
+  const classBoxes = {};
+  for (const label of CONFIRM_LABELS) {
+    classScores[label] = 0;
+    classBoxes[label] = null;
+  }
   const parts = [];
   for (const i of keep) {
     const classId = classIds[i];
     if (CONFIRM_IDS.includes(classId)) {
       const label = LABELS[classId];
-      parts.push({ score: scores[i], class: label });
-      if (scores[i] > classScores[label]) classScores[label] = scores[i];
+      const box = boxes[i];
+      parts.push({ score: scores[i], class: label, box });
+      if (scores[i] > classScores[label]) {
+        classScores[label] = scores[i];
+        classBoxes[label] = box;
+      }
       if (scores[i] > maxConfirmScore) {
         maxConfirmScore = scores[i];
         maxConfirmLabel = label;
       }
     }
   }
-  return { matched: parts.length > 0, maxScore: maxConfirmScore, label: maxConfirmLabel, classScores, parts };
+  return { matched: parts.length > 0, maxScore: maxConfirmScore, label: maxConfirmLabel, classScores, classBoxes, parts };
 }
 
 self.onmessage = async (e) => {

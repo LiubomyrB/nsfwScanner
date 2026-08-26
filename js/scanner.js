@@ -168,7 +168,7 @@
 
   function classifyNudeNet(pool, bitmap) {
     return dispatchToPool("nudenet", pool, { bitmap, minScore: 0.2 }, [bitmap])
-      .then((r) => ({ matched: r.matched, maxScore: r.maxScore, label: r.label, classScores: r.classScores }));
+      .then((r) => ({ matched: r.matched, maxScore: r.maxScore, label: r.label, classScores: r.classScores, classBoxes: r.classBoxes }));
   }
 
   // Same shape as classifyNSFW ({probability, label}), for code paths that use NudeNet as a
@@ -176,13 +176,15 @@
   // body-part class NudeNet matched, e.g. "female-breast-bare") is only meaningful when
   // something was actually matched — left undefined otherwise, same as classifyNSFW leaves
   // it undefined for nothing-interesting frames it never even attempts a label for.
-  // `classScores` (per-class max score, 0 for classes with nothing detected) is always
-  // present regardless of `matched` — it's what applyClassThresholds re-filters samples by.
+  // `classScores`/`classBoxes` (per-class max score and the box that earned it) are always
+  // present regardless of `matched` — they're what applyClassThresholds re-filters samples
+  // by and reads a snapshot crop rectangle from.
   function classifyNudeNetAsProbability(pool, bitmap) {
     return classifyNudeNet(pool, bitmap).then((r) => ({
       probability: r.matched ? r.maxScore : 0,
       label: r.matched ? r.label : undefined,
       classScores: r.classScores,
+      classBoxes: r.classBoxes,
     }));
   }
 
@@ -309,9 +311,11 @@
   // it, and pads the rest with black — exactly how sd-extension-nudenet's Python reference
   // (read_image()) prepares input for this model, which matters here because unlike
   // NSFWJS's crop, stretching would distort the proportions this model was trained on.
-  function grabLetterboxBitmap(video, canvas, ctx, size) {
-    const vw = video.videoWidth || 1;
-    const vh = video.videoHeight || 1;
+  // Shared by grabLetterboxBitmap (below, the forward direction: real video frame -> square
+  // letterboxed model input) and letterboxBoxToVideoFraction (the reverse, used to turn a
+  // detection box back into a snapshot crop rect) — both need the exact same
+  // scale/pad numbers for a given video size, so this is the one place that computes them.
+  function letterboxGeometry(vw, vh, size) {
     const aspect = vw / vh;
     let newW, newH;
     if (vh > vw) {
@@ -323,10 +327,44 @@
     }
     const padLeft = Math.floor((size - newW) / 2);
     const padTop = Math.floor((size - newH) / 2);
+    return { newW, newH, padLeft, padTop };
+  }
+
+  function grabLetterboxBitmap(video, canvas, ctx, size) {
+    const vw = video.videoWidth || 1;
+    const vh = video.videoHeight || 1;
+    const { newW, newH, padLeft, padTop } = letterboxGeometry(vw, vh, size);
     ctx.fillStyle = "black";
     ctx.fillRect(0, 0, size, size);
     ctx.drawImage(video, 0, 0, vw, vh, padLeft, padTop, newW, newH);
     return createImageBitmap(canvas, { resizeWidth: size, resizeHeight: size });
+  }
+
+  // Maps a NudeNet detection box ([cx, cy, w, h], in the NUDENET_INPUT_SIZE-square
+  // letterboxed pixel space nudenet-worker.js's model output is in) back to a fractional
+  // {x, y, w, h} rectangle (0..1, relative to the ORIGINAL video frame) — the inverse of
+  // grabLetterboxBitmap's own mapping. Used by app.js to know what region of the actual
+  // video frame to crop for a segment's snapshot thumbnail, once the real video dimensions
+  // are known (they aren't at scan time inside the worker, only here on the main thread).
+  function letterboxBoxToVideoFraction(box, videoWidth, videoHeight) {
+    const vw = videoWidth || 1;
+    const vh = videoHeight || 1;
+    if (!box) return null;
+    const { newW, newH, padLeft, padTop } = letterboxGeometry(vw, vh, NUDENET_INPUT_SIZE);
+    const scaleX = newW / vw;
+    const scaleY = newH / vh;
+    const [cx, cy, w, h] = box;
+    const x1 = (cx - w / 2 - padLeft) / scaleX;
+    const y1 = (cy - h / 2 - padTop) / scaleY;
+    const x2 = (cx + w / 2 - padLeft) / scaleX;
+    const y2 = (cy + h / 2 - padTop) / scaleY;
+    const clamp01 = (v) => Math.max(0, Math.min(1, v));
+    const fx1 = clamp01(x1 / vw);
+    const fy1 = clamp01(y1 / vh);
+    const fx2 = clamp01(x2 / vw);
+    const fy2 = clamp01(y2 / vh);
+    if (fx2 <= fx1 || fy2 <= fy1) return null;
+    return { x: fx1, y: fy1, w: fx2 - fx1, h: fy2 - fy1 };
   }
 
   // Two-pass adaptive scan: a fast coarse pass across the whole video first, then a
@@ -525,7 +563,7 @@
         if (opts.onProgress) opts.onProgress(Math.min(100, (done / times.length) * 100));
       },
     });
-    const classifiedByTime = new Map(classified.map((c) => [c.time, { probability: c.probability, label: c.label, classScores: c.classScores }]));
+    const classifiedByTime = new Map(classified.map((c) => [c.time, { probability: c.probability, label: c.label, classScores: c.classScores, classBoxes: c.classBoxes }]));
 
     const result = [];
     for (const run of runs) {
@@ -542,9 +580,9 @@
               nearestTime = t;
             }
           }
-          entry = nearestTime !== null ? classifiedByTime.get(nearestTime) : { probability: 0, label: undefined, classScores: undefined };
+          entry = nearestTime !== null ? classifiedByTime.get(nearestTime) : { probability: 0, label: undefined, classScores: undefined, classBoxes: undefined };
         }
-        result.push({ time: s.time, probability: entry.probability, label: entry.label, classScores: entry.classScores });
+        result.push({ time: s.time, probability: entry.probability, label: entry.label, classScores: entry.classScores, classBoxes: entry.classBoxes });
       }
     }
     return result;
@@ -577,15 +615,16 @@
     }
     const pool = await getWorkerPool("nudenet", opts.onStatus, "confirmation");
     const verdicts = await classifyRunsWithDedup(video, captureFn, pool, classifyNudeNetAsProbability, runs, opts);
-    const verdictByTime = new Map(verdicts.map((v) => [v.time, { probability: v.probability, label: v.label, classScores: v.classScores }]));
+    const verdictByTime = new Map(verdicts.map((v) => [v.time, { probability: v.probability, label: v.label, classScores: v.classScores, classBoxes: v.classBoxes }]));
 
     const result = samples.map((s) => {
       const v = verdictByTime.get(s.time);
       if (!v) return s;
-      // NudeNet's own class label/scores (specific body part, e.g. "female-breast-bare")
-      // replace whatever the NSFWJS primary pass had for this sample — it's the more
-      // precise verdict, being what actually decided this sample's confirmed probability.
-      return { time: s.time, probability: v.probability, label: v.label, classScores: v.classScores };
+      // NudeNet's own class label/scores/boxes (specific body part, e.g.
+      // "female-breast-bare") replace whatever the NSFWJS primary pass had for this sample
+      // — it's the more precise verdict, being what actually decided this sample's
+      // confirmed probability.
+      return { time: s.time, probability: v.probability, label: v.label, classScores: v.classScores, classBoxes: v.classBoxes };
     });
     if (opts.onProgress) opts.onProgress(100);
     return result;
@@ -733,7 +772,11 @@
   // real gap to the next sample (capped, to avoid a huge tail if coverage has a hole),
   // falling back to `fallbackInterval` for an open-ended run at the very end of the
   // samples array — this also makes segment boundaries correct for adaptive scans, whose
-  // samples aren't evenly spaced.
+  // samples aren't evenly spaced. Each returned segment also carries `peakTime`/`box`/
+  // `label` from whichever sample inside it hit `maxProb` — the "moment that triggered the
+  // detection", used by app.js to crop a snapshot thumbnail for that segment. Callers that
+  // don't care (existing ones — blur playback just reads start/end) simply ignore the extra
+  // fields.
   function mergeSegments(samples, sensitivity, fallbackInterval) {
     if (!samples || !samples.length) return [];
     const gapFallback = fallbackInterval || 1;
@@ -741,25 +784,29 @@
     let start = null;
     let last = null;
     let maxProb = 0;
+    let peakTime = null;
+    let peakBox;
+    let peakLabel;
 
     for (let i = 0; i < samples.length; i++) {
       const s = samples[i];
       if (s.probability >= sensitivity) {
-        if (start === null) {
-          start = s.time;
+        if (start === null || s.probability > maxProb) {
           maxProb = s.probability;
-        } else {
-          maxProb = Math.max(maxProb, s.probability);
+          peakTime = s.time;
+          peakBox = s.box;
+          peakLabel = s.label;
         }
+        if (start === null) start = s.time;
         last = s.time;
       } else if (start !== null) {
         const gap = clamp(s.time - last, gapFallback * 0.1, gapFallback * 4);
-        segments.push({ start, end: last + gap, probability: maxProb });
+        segments.push({ start, end: last + gap, probability: maxProb, peakTime, box: peakBox, label: peakLabel });
         start = null;
       }
     }
     if (start !== null) {
-      segments.push({ start, end: last + gapFallback, probability: maxProb });
+      segments.push({ start, end: last + gapFallback, probability: maxProb, peakTime, box: peakBox, label: peakLabel });
     }
     return segments;
   }
@@ -781,12 +828,19 @@
     return samples.map((s) => {
       if (!s.classScores) return s;
       let best = 0;
+      let bestBox;
       for (const cls of CONFIRM_LABELS) {
         const score = s.classScores[cls] || 0;
         const threshold = (classThresholds && typeof classThresholds[cls] === "number") ? classThresholds[cls] : 0;
-        if (score >= threshold && score > best) best = score;
+        if (score >= threshold && score > best) {
+          best = score;
+          bestBox = s.classBoxes && s.classBoxes[cls];
+        }
       }
-      return { time: s.time, probability: best, label: s.label, classScores: s.classScores };
+      // `box` (in nudenet-worker.js's letterboxed reference space) is whichever class
+      // actually decided this sample's probability — the specific detection a snapshot
+      // thumbnail should crop (see app.js's renderTimecodesSnapshotGrid).
+      return { time: s.time, probability: best, label: s.label, classScores: s.classScores, box: bestBox || undefined };
     });
   }
 
@@ -819,6 +873,7 @@
     scanVideoFile,
     mergeSegments,
     applyClassThresholds,
+    letterboxBoxToVideoFraction,
     formatTime,
     computeCoarseInterval,
     segmentsToTxt,

@@ -355,6 +355,89 @@ html, body {
   margin: 0;
 }
 
+.snapshot-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(110px, 1fr));
+  gap: 10px;
+  margin: 10px 0 16px;
+  max-height: 40vh;
+  overflow-y: auto;
+  padding-right: 2px;
+}
+.snapshot-grid:empty {
+  display: none;
+}
+.snapshot-item {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.snapshot-thumb-wrap {
+  position: relative;
+  width: 100%;
+  aspect-ratio: 1 / 1;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  overflow: hidden;
+}
+.snapshot-thumb {
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  display: block;
+  cursor: pointer;
+  filter: blur(0);
+  transition: filter .15s ease;
+  opacity: 0;
+}
+.snapshot-thumb.loaded {
+  opacity: 1;
+}
+.snapshot-thumb.blurred {
+  filter: blur(14px);
+}
+.snapshot-thumb-placeholder {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--dim);
+  font-size: 11px;
+  text-align: center;
+  padding: 6px;
+}
+.snapshot-thumb-placeholder.hidden {
+  display: none;
+}
+.snapshot-thumb-placeholder:not(.empty) {
+  background: linear-gradient(90deg, var(--panel) 25%, var(--border) 37%, var(--panel) 63%);
+  background-size: 400% 100%;
+  animation: snapshot-shimmer 1.4s ease infinite;
+}
+@keyframes snapshot-shimmer {
+  0% { background-position: 100% 0; }
+  100% { background-position: 0 0; }
+}
+.snapshot-checkbox {
+  position: absolute;
+  top: 6px;
+  right: 6px;
+  width: 18px;
+  height: 18px;
+  margin: 0;
+  cursor: pointer;
+  accent-color: var(--accent);
+  filter: drop-shadow(0 1px 2px rgba(0,0,0,.6));
+}
+.snapshot-time {
+  font-size: 11px;
+  color: var(--dim);
+  text-align: center;
+  font-variant-numeric: tabular-nums;
+}
+
 .field {
   display: flex;
   flex-direction: column;

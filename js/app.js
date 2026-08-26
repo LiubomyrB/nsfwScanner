@@ -12,6 +12,20 @@
     { key: "buttocks-bare", i18nKey: "settings.classButtocksBare" },
   ];
 
+  const CONFIRM_CLASS_I18N_BY_KEY = {};
+  CONFIRM_CLASSES.forEach((c) => { CONFIRM_CLASS_I18N_BY_KEY[c.key] = c.i18nKey; });
+
+  // The human-readable class name for a snapshot grid caption (see
+  // buildSnapshotGridSkeleton) — reuses the exact same translated names as the per-class
+  // sensitivity sliders, so "female-breast-bare" reads as "Female breast" etc. Falls back to
+  // the segment's own time range for a sample with no recognized label (e.g. a legacy scan
+  // from before per-class detection existed).
+  function classCaptionText(seg) {
+    const i18nKey = seg.label && CONFIRM_CLASS_I18N_BY_KEY[seg.label];
+    if (i18nKey) return VMI18n.t(i18nKey);
+    return VMScanner.formatTime(seg.start) + " – " + VMScanner.formatTime(seg.end);
+  }
+
   function defaultClassThresholds() {
     const obj = {};
     CONFIRM_CLASSES.forEach((c) => { obj[c.key] = 0; });
@@ -59,6 +73,12 @@
   // startScan) — shows a one-line "scanned in Xs, N scenes found" stats line at the top of
   // the dialog in that case only, not when the user opens it manually via the toolbar button.
   let lastScanStats = null;
+  // Guards against an in-flight snapshot-capture batch (which seeks a throwaway <video> once
+  // per segment, so it's inherently slow-ish) finishing after a *newer* one has already
+  // started (e.g. the user dragged a class-threshold slider again mid-capture) and clobbering
+  // that newer render's thumbnails with stale ones.
+  let snapshotRenderToken = 0;
+  let snapshotGridDebounceTimer = null;
   // "native" (plain <video>, the default/preferred path whenever it works) or "mediabunny"
   // (canvas + Web Audio playback via js/mediabunny-player.js — used only as a fallback for
   // files whose audio the browser can't decode natively but mediabunny can, e.g. AC3/E-AC-3,
@@ -104,7 +124,7 @@
       "fullscreenBtn", "enterFullscreenIcon", "exitFullscreenIcon",
       "fileInput",
       "existingDialogOverlay", "existingDialogText", "useExistingBtn", "rescanBtn",
-      "timecodesDialogOverlay", "timecodesStats", "classThresholdsTimecodes", "timecodesContent",
+      "timecodesDialogOverlay", "timecodesStats", "classThresholdsTimecodes", "timecodesSnapshotGrid", "timecodesContent",
       "downloadTimecodesBtn", "downloadSubtitlesBtn", "closeTimecodesBtn",
       "assInfoDialogOverlay", "assInfoCloseX", "assInfoSaveBtn",
       "transcodeWarningOverlay", "transcodeWarningTitle", "transcodeReasonText", "transcodeFileName",
@@ -145,7 +165,7 @@
     });
     els.downloadTimecodesBtn.addEventListener("click", () => {
       if (!activeVideo) return;
-      const segments = activeVideo.liveTimecodesSegments || [];
+      const segments = currentFilteredTimecodesSegments();
       const txt = VMScanner.segmentsToTxt(segments, activeVideo.fileName);
       downloadTxt(txt, baseName(activeVideo.fileName) + "_timecodes.txt");
     });
@@ -333,6 +353,7 @@
     recomputeActiveSegments();
     if (activeVideo && !els.timecodesDialogOverlay.classList.contains("hidden")) {
       renderTimecodesDialogContent();
+      scheduleSnapshotGridRender(false);
     }
   }
 
@@ -373,6 +394,7 @@
     renderTimecodesDialogStats();
     syncClassThresholdInputs();
     renderTimecodesDialogContent();
+    scheduleSnapshotGridRender(true);
     els.timecodesDialogOverlay.classList.remove("hidden");
   }
 
@@ -385,10 +407,145 @@
   function renderTimecodesDialogContent() {
     if (!activeVideo) return;
     const filtered = VMScanner.applyClassThresholds(activeVideo.samples, settings.classThresholds);
-    const segments = VMScanner.mergeSegments(filtered, VMScanner.REPORT_FLOOR, activeVideo.interval);
-    activeVideo.liveTimecodesSegments = segments;
+    // Full list (every detected segment, checked or not) — kept as-is so the snapshot grid
+    // below can still show/toggle every segment, including ones currently unchecked.
+    activeVideo.liveTimecodesSegments = VMScanner.mergeSegments(filtered, VMScanner.REPORT_FLOOR, activeVideo.interval);
+    renderTimecodesTextList();
+  }
+
+  // Renders the plain-text list from activeVideo.liveTimecodesSegments, filtered by the
+  // current checkbox state — so what's shown here always matches exactly what
+  // "Download"/"Download as subtitles" will export. Separate from
+  // renderTimecodesDialogContent (which also recomputes the underlying segment list itself)
+  // so a checkbox toggle can refresh just the visible text without re-running the class-
+  // threshold merge or touching the snapshot grid/thumbnails.
+  function renderTimecodesTextList() {
+    if (!activeVideo) return;
+    const segments = excludeUncheckedSnapshots(activeVideo.liveTimecodesSegments || []);
     const txt = segments.length ? VMScanner.segmentsToTxt(segments, activeVideo.fileName) : "";
     els.timecodesContent.textContent = txt || VMI18n.t("timecodesDialog.none");
+  }
+
+  // Debounced wrapper around renderTimecodesSnapshotGrid — a class-threshold slider fires
+  // its "input" event continuously while being dragged, and each render seeks a throwaway
+  // video once per segment (see js/snapshots.js), so rebuilding the grid on every single
+  // tick of a drag would be both wasteful and janky. `immediate: true` (dialog just opened,
+  // a deliberate one-off action) skips the wait.
+  function scheduleSnapshotGridRender(immediate) {
+    clearTimeout(snapshotGridDebounceTimer);
+    if (immediate) {
+      renderTimecodesSnapshotGrid();
+      return;
+    }
+    snapshotGridDebounceTimer = setTimeout(renderTimecodesSnapshotGrid, 350);
+  }
+
+  // Rebuilds the snapshot grid from activeVideo.liveTimecodesSegments (set by
+  // renderTimecodesDialogContent, which always runs first — see openTimecodesDialog/
+  // onClassThresholdChange). Draws placeholder cells synchronously, then fills in each
+  // thumbnail as VMSnapshots.captureBatch resolves it, so a long segment list doesn't block
+  // the grid from appearing at all. Guarded by snapshotRenderToken against a stale in-flight
+  // batch (from a since-superseded render) overwriting a newer one's thumbnails.
+  async function renderTimecodesSnapshotGrid() {
+    if (!activeVideo) return;
+    const myToken = ++snapshotRenderToken;
+    const segments = activeVideo.liveTimecodesSegments || [];
+    buildSnapshotGridSkeleton(segments);
+    if (!segments.length) return;
+    const { width: vw, height: vh } = getVideoDimensions();
+    const items = segments.map((seg) => ({
+      time: typeof seg.peakTime === "number" ? seg.peakTime : seg.start,
+      rect: seg.box ? VMScanner.letterboxBoxToVideoFraction(seg.box, vw, vh) : null,
+    }));
+    await VMSnapshots.captureBatch(activeVideo.file, items, (i, dataUrl) => {
+      if (myToken !== snapshotRenderToken) return; // superseded by a newer render
+      setSnapshotThumb(i, dataUrl);
+    });
+  }
+
+  // Builds one grid cell per segment: a blurred (by default) thumbnail placeholder, a
+  // top-right inclusion checkbox (checked unless previously excluded — see
+  // onSnapshotCheckboxChange), and a start–end time label. The actual image src is filled in
+  // later, asynchronously, by renderTimecodesSnapshotGrid.
+  function buildSnapshotGridSkeleton(segments) {
+    const grid = els.timecodesSnapshotGrid;
+    grid.innerHTML = "";
+    segments.forEach((seg) => {
+      const peakTime = typeof seg.peakTime === "number" ? seg.peakTime : seg.start;
+      const excluded = activeVideo.excludedSnapshotTimes.has(roundTime(peakTime));
+
+      const item = document.createElement("div");
+      item.className = "snapshot-item";
+
+      const thumbWrap = document.createElement("div");
+      thumbWrap.className = "snapshot-thumb-wrap";
+
+      const img = document.createElement("img");
+      img.className = "snapshot-thumb blurred";
+      img.alt = "";
+      img.addEventListener("click", () => img.classList.remove("blurred"));
+      thumbWrap.appendChild(img);
+
+      const placeholder = document.createElement("div");
+      placeholder.className = "snapshot-thumb-placeholder";
+      thumbWrap.appendChild(placeholder);
+
+      const checkbox = document.createElement("input");
+      checkbox.type = "checkbox";
+      checkbox.className = "snapshot-checkbox";
+      checkbox.checked = !excluded;
+      checkbox.setAttribute("aria-label", VMI18n.t("timecodesDialog.snapshotCheckboxLabel"));
+      checkbox.addEventListener("change", () => onSnapshotCheckboxChange(peakTime, checkbox.checked));
+      thumbWrap.appendChild(checkbox);
+
+      item.appendChild(thumbWrap);
+
+      const timeLabel = document.createElement("div");
+      timeLabel.className = "snapshot-time";
+      timeLabel.textContent = classCaptionText(seg);
+      // Still available on hover for anyone who wants the exact moment, without cluttering
+      // the caption itself.
+      timeLabel.title = VMScanner.formatTime(seg.start) + " – " + VMScanner.formatTime(seg.end);
+      item.appendChild(timeLabel);
+
+      grid.appendChild(item);
+    });
+  }
+
+  // Fills in one grid cell's thumbnail once its capture resolves (or marks it as having no
+  // preview available, e.g. a legacy sample with no detection box).
+  function setSnapshotThumb(index, dataUrl) {
+    const item = els.timecodesSnapshotGrid.children[index];
+    if (!item) return;
+    const img = item.querySelector(".snapshot-thumb");
+    const placeholder = item.querySelector(".snapshot-thumb-placeholder");
+    if (dataUrl) {
+      img.src = dataUrl;
+      img.classList.add("loaded");
+      if (placeholder) placeholder.classList.add("hidden");
+    } else if (placeholder) {
+      placeholder.classList.add("empty");
+      placeholder.textContent = VMI18n.t("timecodesDialog.snapshotUnavailable");
+    }
+  }
+
+  function onSnapshotCheckboxChange(peakTime, checked) {
+    if (!activeVideo) return;
+    const key = roundTime(peakTime);
+    if (checked) activeVideo.excludedSnapshotTimes.delete(key);
+    else activeVideo.excludedSnapshotTimes.add(key);
+    persistExcludedSnapshotTimes();
+    recomputeActiveSegments();
+    renderTimecodesTextList();
+  }
+
+  async function persistExcludedSnapshotTimes() {
+    if (!activeVideo) return;
+    const record = await VMDB.get("videos", activeVideo.fileName);
+    if (!record) return;
+    record.excludedSnapshotTimes = Array.from(activeVideo.excludedSnapshotTimes);
+    record.updatedAt = Date.now();
+    await VMDB.put("videos", record);
   }
 
   function renderTimecodesDialogStats() {
@@ -427,15 +584,9 @@
   async function saveAssSubtitles() {
     if (!activeVideo) return;
     const { width, height } = getVideoDimensions();
-    // Same list as the Timecodes dialog is currently showing (REPORT_FLOOR + per-class
-    // thresholds), not the general-sensitivity-gated blur segments — the dialog's own
-    // "Download as subtitles" button is the only way to reach this, so
-    // liveTimecodesSegments is always populated by the time this runs.
-    const segments = activeVideo.liveTimecodesSegments || VMScanner.mergeSegments(
-      VMScanner.applyClassThresholds(activeVideo.samples, settings.classThresholds),
-      VMScanner.REPORT_FLOOR,
-      activeVideo.interval
-    );
+    // Same list as the Timecodes dialog's text view (REPORT_FLOOR + per-class thresholds +
+    // current checkbox exclusions), not the general-sensitivity-gated blur segments.
+    const segments = currentFilteredTimecodesSegments();
     const assContent = VMAssExport.generate(width, height, segments, settings.blurAdvance || 0);
     const suggestedName = baseName(activeVideo.fileName) + ".ass";
 
@@ -504,7 +655,40 @@
   function recomputeActiveSegments() {
     if (!activeVideo) return;
     const filtered = VMScanner.applyClassThresholds(activeVideo.samples, settings.classThresholds);
-    activeVideo.segments = VMScanner.mergeSegments(filtered, settings.sensitivity, activeVideo.interval);
+    const segments = VMScanner.mergeSegments(filtered, settings.sensitivity, activeVideo.interval);
+    activeVideo.segments = excludeUncheckedSnapshots(segments);
+  }
+
+  // Rounded to milliseconds — the stable key used to remember which segment a snapshot
+  // checkbox belongs to (see onSnapshotCheckboxChange) across re-renders, since raw sample
+  // times can carry more float noise than is meaningful to match on.
+  function roundTime(t) {
+    return Math.round(t * 1000) / 1000;
+  }
+
+  // Drops any segment whose peak-detection moment the user unchecked in the Timecodes
+  // dialog's snapshot grid — applied to whatever downstream consumer the checkboxes are
+  // documented to affect (blur-trigger segments here, ASS export in saveAssSubtitles).
+  // Deliberately NOT applied to the Timecodes dialog's own displayed list/txt-download,
+  // which is meant to keep showing everything the scan found regardless of what's checked.
+  function excludeUncheckedSnapshots(segments) {
+    if (!activeVideo || !activeVideo.excludedSnapshotTimes || !activeVideo.excludedSnapshotTimes.size) return segments;
+    return segments.filter((seg) => {
+      const peak = typeof seg.peakTime === "number" ? seg.peakTime : seg.start;
+      return !activeVideo.excludedSnapshotTimes.has(roundTime(peak));
+    });
+  }
+
+  // Freshly recomputes the detected-scenes list (REPORT_FLOOR + current per-class
+  // thresholds) and applies the current checkbox exclusions — used by both export buttons
+  // (txt download, ASS export) so what they produce can never drift from a stale cached
+  // array, regardless of what's happened to activeVideo.liveTimecodesSegments in the
+  // meantime.
+  function currentFilteredTimecodesSegments() {
+    if (!activeVideo) return [];
+    const filtered = VMScanner.applyClassThresholds(activeVideo.samples, settings.classThresholds);
+    const segments = VMScanner.mergeSegments(filtered, VMScanner.REPORT_FLOOR, activeVideo.interval);
+    return excludeUncheckedSnapshots(segments);
   }
 
   // ---------- file picking ----------
@@ -862,6 +1046,9 @@
       // was found at scan time.
       txtContent: record.txtContent,
       transcoded: !!record.transcoded,
+      // peakTime values (rounded via roundTime) the user unchecked in the snapshot grid —
+      // restored from the stored record so a reload/resume keeps the same scenes excluded.
+      excludedSnapshotTimes: new Set(record.excludedSnapshotTimes || []),
     };
     recomputeActiveSegments();
     updatePlayerControls(resumeTime || 0);

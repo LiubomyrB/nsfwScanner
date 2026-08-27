@@ -134,7 +134,6 @@
   // worker couldn't find a matching frame for.
   async function sampleAtTimes(times, onSampleDone) {
     const results = [];
-    console.log('sampleAtTimes START', times)
     for (const time of times) {
       if (cancelled) break;
       self.postMessage({ type: "seek", time });
@@ -206,7 +205,6 @@
   // for the full reasoning); only the "how do I get a sample" mechanism differs here.
   async function scanAdaptive(duration, fineInterval, sensitivity, dedupFinePass, onProgress, onStatus) {
     const coarseInterval = computeCoarseInterval(fineInterval);
-    console.log('scanAdaptive START', coarseInterval, fineInterval)
     if (onStatus) onStatus("scan.statusCoarsePass");
     const coarseTimes = buildUniformTimes(duration, coarseInterval);
     let coarseDone = 0;

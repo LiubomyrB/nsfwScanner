@@ -15,7 +15,7 @@
 // Trade-off worth knowing: on one borderline (non-nude, swimwear) test photo, this model
 // scored "female-vagina" at 0.57 vs the old model's ~0.30 on the same image — still under
 // the app's default 0.6 sensitivity, but a real difference in calibration, not just speed.
-const ORT_BASE = "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.19.2/dist/";
+const ORT_BASE = "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.30.0-dev.20260826-b1f76d586a/dist/";
 importScripts(ORT_BASE + "ort.min.js");
 
 const MODEL_URL = "https://cdn.jsdelivr.net/gh/vladmandic/sd-extension-nudenet@main/nudenet.onnx";
@@ -49,13 +49,22 @@ const CONFIRM_IDS = CONFIRM_LABELS.map((l) => LABELS.indexOf(l));
 // cross-origin isolated (COOP/COEP headers). Fall back to a single thread rather than
 // fail outright if that's not available.
 const isCrossOriginIsolated = typeof self !== "undefined" && self.crossOriginIsolated === true && typeof SharedArrayBuffer !== "undefined";
-ort.env.wasm.numThreads = isCrossOriginIsolated ? ((self.navigator && self.navigator.hardwareConcurrency) || 4) : 1;
+// Capped at 4 rather than raw hardwareConcurrency — measured directly (1 vs 4 vs 16 threads,
+// same file, foreground and backgrounded): 16 threads was slower than 4 in BOTH conditions
+// (0.107s vs 0.070s per session.run() foreground; 1.285s vs 0.285s backgrounded) — thread
+// count beyond what this model's workload actually parallelizes well just adds scheduling/
+// sync overhead, which gets much worse once a backgrounded tab's CPU budget shrinks and
+// those threads end up fighting over table scraps. This also confirmed background
+// throttling itself isn't a threading artifact: even 1 thread (no contention possible) was
+// ~6x slower backgrounded than foreground — a real OS/browser-level CPU-priority floor for
+// backgrounded tabs, not something thread tuning alone escapes.
+ort.env.wasm.numThreads = isCrossOriginIsolated ? Math.min(4, (self.navigator && self.navigator.hardwareConcurrency) || 4) : 1;;
 ort.env.wasm.simd = true;
 
 let sessionPromise = null;
 function getSession() {
   if (!sessionPromise) {
-    sessionPromise = ort.InferenceSession.create(MODEL_URL, { executionProviders: ["wasm"] });
+    sessionPromise = ort.InferenceSession.create(MODEL_URL, { executionProviders: ["webgpu", "wasm"] });
   }
   return sessionPromise;
 }
@@ -90,11 +99,13 @@ function nms(boxes, scores, iouThresh) {
 // the upstream Python reference (sd-extension-nudenet's read_image()) prepares input, so
 // no further resizing happens here, just pixel extraction.
 async function detect(session, bitmap, minScore) {
+    let time0 = performance.now();
+
   const canvas = new OffscreenCanvas(INPUT_SIZE, INPUT_SIZE);
   const ctx = canvas.getContext("2d");
   ctx.drawImage(bitmap, 0, 0, INPUT_SIZE, INPUT_SIZE);
   const imgData = ctx.getImageData(0, 0, INPUT_SIZE, INPUT_SIZE).data;
-
+let time1 = performance.now();
   // HWC RGBA -> CHW RGB, normalized 0..1.
   const plane = INPUT_SIZE * INPUT_SIZE;
   const chw = new Float32Array(3 * plane);
@@ -105,14 +116,27 @@ async function detect(session, bitmap, minScore) {
     chw[2 * plane + i] = imgData[o + 2] / 255;
   }
 
+  let time2 = performance.now();
+
   const tensor = new ort.Tensor("float32", chw, [1, 3, INPUT_SIZE, INPUT_SIZE]);
+console.log('detect 1', (performance.now() - time2) / 1000)
+
+
+ let timeE = performance.now();
+  
   const feeds = {};
   feeds[session.inputNames[0]] = tensor;
+  console.log('detect tensor', ort, (performance.now() - time2) / 1000)
+
   const results = await session.run(feeds);
+  console.log('detect E', (performance.now() - timeE) / 1000)
+
   const output = results[session.outputNames[0]]; // [1, 4+numClasses, numBoxes] (YOLO-style)
   const numAttrs = output.dims[1];
   const numBoxes = output.dims[2];
   const data = output.data;
+  let time3 = performance.now();
+    
 
   const boxes = [];
   const scores = [];
@@ -134,6 +158,7 @@ async function detect(session, bitmap, minScore) {
     }
   }
   const keep = nms(boxes, scores, 0.45);
+    console.log('detect 2', (performance.now() - time3) / 1000)
 
   let maxConfirmScore = 0;
   let maxConfirmLabel;
@@ -146,6 +171,8 @@ async function detect(session, bitmap, minScore) {
   // its max score — lets callers crop a snapshot of exactly what triggered the detection
   // (see scanner.js's letterboxBoxToVideoFraction, which maps this space back to the real
   // video frame once the actual video dimensions are known).
+    let time4 = performance.now();
+
   const classBoxes = {};
   for (const label of CONFIRM_LABELS) {
     classScores[label] = 0;
@@ -154,7 +181,6 @@ async function detect(session, bitmap, minScore) {
   const parts = [];
   for (const i of keep) {
     const classId = classIds[i];
-    console.log('label', LABELS[classId])
     if (CONFIRM_IDS.includes(classId)) {
       const label = LABELS[classId];
       const box = boxes[i];
@@ -169,8 +195,9 @@ async function detect(session, bitmap, minScore) {
       }
     }
   }
+    console.log('detect 3', (performance.now() - time4) / 1000)
+    console.log('detect F', (performance.now() - time0) / 1000)
 
-  console.log('scores', scores, parts)
   return { matched: parts.length > 0, maxScore: maxConfirmScore, label: maxConfirmLabel, classScores, classBoxes, parts };
 }
 
@@ -187,15 +214,11 @@ async function detect(session, bitmap, minScore) {
 let streamReader = null;
 let coordinatorPort = null;
 
-const FRAME_MATCH_EPSILON = 0.03;
 const FRAME_WAIT_TIMEOUT_MS = 1000;
 
-// Drains the stream until a frame at/after `time` (within FRAME_MATCH_EPSILON) arrives,
-// discarding stale (pre-seek) frames along the way — same logic as frame-reader-worker.js,
-// duplicated here rather than shared (no module system across the worker boundary in this
-// classic-script app). Returns null if nothing matches within the deadline.
+// Drains the stream until a frame at/after `time` arrives, discarding stale (pre-seek)
+// frames along the way. Returns null if nothing matches within the deadline.
 async function getFrameAt(time) {
-    console.log('getFrameAt START', time)
   const deadline = Date.now() + FRAME_WAIT_TIMEOUT_MS;
   while (Date.now() < deadline) {
     const remaining = deadline - Date.now();
@@ -203,19 +226,12 @@ async function getFrameAt(time) {
       streamReader.read(),
       new Promise((resolve) => setTimeout(() => resolve({ timedOut: true }), remaining)),
     ]);
-    if (outcome.timedOut) {
-
-        console.log('getFrameAt timedOut', time)
-        break;
-    }
+    if (outcome.timedOut) break;
     const { value, done } = outcome;
     if (done || !value) break;
-    
+
     const frameTime = value.timestamp / 1e6;
-    if (frameTime >= time - FRAME_MATCH_EPSILON) {
-        console.log('getFrameAt value', time, value)
-        return value;
-    }
+    if (frameTime >= time) return value;
     value.close();
   }
   return null;
@@ -240,6 +256,7 @@ function letterboxGeometry(vw, vh, size) {
 // a VideoFrame pulled off the stream instead of a <video> element, and staying entirely in
 // this worker (no canvas/bitmap hop back through the main thread).
 async function detectAtTime(time, minScore) {
+    let time1 = performance.now();
   const frame = await getFrameAt(time);
   if (!frame) return null;
   const vw = frame.displayWidth || 1;
@@ -252,8 +269,12 @@ async function detectAtTime(time, minScore) {
   ctx.drawImage(frame, 0, 0, vw, vh, padLeft, padTop, newW, newH);
   frame.close();
   const bitmap = await createImageBitmap(canvas);
+    console.log('detectAtTime 1', (performance.now() - time1) / 1000)
   const session = await getSession();
+
+    let time2 = performance.now();
   const result = await detect(session, bitmap, minScore);
+    console.log('detectAtTime 2', (performance.now() - time2) / 1000)
   bitmap.close();
   return result;
 }

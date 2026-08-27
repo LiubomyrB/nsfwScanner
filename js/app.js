@@ -903,6 +903,7 @@
     showScanScreen();
     cancelToken = VMScanner.createCancelToken();
     const scanStartedAt = Date.now();
+    startBackgroundKeepAliveAudio();
     try {
       const { samples, duration, interval } = await VMScanner.scanVideoFile(file, {
         onProgress: updateScanProgress,
@@ -960,6 +961,58 @@
       console.error(e);
       alert(VMI18n.t("scan.failed", { message: e && e.message ? e.message : e }));
       showStartScreen();
+    } finally {
+      stopBackgroundKeepAliveAudio();
+    }
+  }
+
+  // ---------- background CPU-throttling mitigation ----------
+
+  // Chrome (and other browsers) apply a much lower OS-level CPU scheduling priority to the
+  // entire renderer process backing a backgrounded tab — this affects every thread in that
+  // process, including Web Workers and whatever nested worker threads they spawn internally
+  // (e.g. onnxruntime-web's own multi-threaded WASM backend, used by nudenet-worker.js),
+  // not just specific JS APIs like requestAnimationFrame. There's no API to request an
+  // unthrottled thread, but browsers exempt a tab from this while it's actively producing
+  // audio output — the same reason a backgrounded music tab or video call doesn't slow down
+  // — so playing a continuous, virtually silent tone for the scan's duration is the standard
+  // technique for invoking that exemption. Reproduced directly: NudeNet inference (ONNX
+  // tensor construction/session.run, already running inside a Worker) measured ~13x slower
+  // once backgrounded.
+  let keepAliveAudioCtx = null;
+  let keepAliveOscillator = null;
+
+  function startBackgroundKeepAliveAudio() {
+    if (keepAliveAudioCtx) return;
+    try {
+      const Ctx = window.AudioContext || window.webkitAudioContext;
+      if (!Ctx) return;
+      keepAliveAudioCtx = new Ctx();
+      const gain = keepAliveAudioCtx.createGain();
+      // Not literally 0 — a truly silent signal risks not registering as "this tab is
+      // playing audio" for throttling-exemption purposes on some browsers. Inaudible at any
+      // real-world volume either way.
+      gain.gain.value = 0.0001;
+      keepAliveOscillator = keepAliveAudioCtx.createOscillator();
+      keepAliveOscillator.frequency.value = 20000; // also outside most people's hearing range
+      keepAliveOscillator.connect(gain);
+      gain.connect(keepAliveAudioCtx.destination);
+      keepAliveOscillator.start();
+    } catch (e) {
+      console.warn("Could not start background keep-alive audio.", e);
+      keepAliveAudioCtx = null;
+      keepAliveOscillator = null;
+    }
+  }
+
+  function stopBackgroundKeepAliveAudio() {
+    if (keepAliveOscillator) {
+      try { keepAliveOscillator.stop(); } catch (e) { /* ignore */ }
+      keepAliveOscillator = null;
+    }
+    if (keepAliveAudioCtx) {
+      try { keepAliveAudioCtx.close(); } catch (e) { /* ignore */ }
+      keepAliveAudioCtx = null;
     }
   }
 

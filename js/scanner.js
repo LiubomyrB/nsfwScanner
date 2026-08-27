@@ -77,6 +77,7 @@
     nsfw: new URL("./scan-worker.js", scriptBase).href,
     nudenet: new URL("./nudenet-worker.js", scriptBase).href,
   };
+  const FRAME_READER_WORKER_URL = new URL("./frame-reader-worker.js", scriptBase).href;
 
   const pools = { nsfw: null, nudenet: null };
   const rrCounters = { nsfw: 0, nudenet: 0 };
@@ -269,19 +270,11 @@
     typeof MediaStreamTrackProcessor !== "undefined" && typeof HTMLVideoElement !== "undefined" &&
     typeof HTMLVideoElement.prototype.captureStream === "function";
 
-  // How far a delivered VideoFrame's timestamp may land *before* the requested seek time
-  // and still count as "the frame for this sample" — seeking generally lands on the nearest
-  // available frame boundary rather than exactly the requested time, so some slack is
-  // needed; kept small relative to the smallest allowed scan interval (0.1s) so it can't
-  // accidentally match a neighboring sample's frame instead.
-  const FRAME_MATCH_EPSILON = 0.03;
-  const FRAME_WAIT_TIMEOUT_MS = 1000;
-
   // Every sampling function below (scanUniform, scanAdaptive, classifyRunsWithDedup,
   // confirmWithNudeNet, sampleAtTimes) takes a `frameSource` instead of a raw <video> —
-  // `frameSource.getFrameAt(time)` resolves to `{drawable, width, height, close()}`, where
-  // `drawable` is whatever ctx.drawImage() should read (a VideoFrame or the video element
-  // itself, depending on which implementation below is active) and close() releases it.
+  // `frameSource.getBitmap(time, mode, size)` resolves straight to a ready-to-classify
+  // ImageBitmap (`mode`: "stretch" for NSFWJS's plain resize, "letterbox" for NudeNet's
+  // aspect-preserving black-padded crop; `size`: output width/height in px).
   //
   // Why this exists: the original approach (seekTo, above) waits on
   // requestAnimationFrame/requestVideoFrameCallback to confirm a seeked frame is actually
@@ -294,55 +287,80 @@
   // produces identical, correct frames whether requestAnimationFrame/
   // requestVideoFrameCallback fire normally or are both forced to never fire at all (i.e.
   // exactly what background-tab throttling does to them).
+  //
+  // The readable stream itself is handed off (as a Transferable, via postMessage) to a
+  // dedicated frame-reader-worker.js — it does the frame-matching *and* the canvas
+  // draw/resize entirely off the main thread, so the actual per-frame CPU cost (today's
+  // biggest main-thread cost during a scan) no longer competes with page/UI rendering
+  // either, on top of not being blocked by tab visibility. Only the seek itself
+  // (video.currentTime = time) has to happen here, since only the main thread has the
+  // <video> element at all.
   function createStreamFrameSource(video) {
     const stream = video.captureStream();
     const track = stream.getVideoTracks()[0];
     const processor = new MediaStreamTrackProcessor({ track });
-    const reader = processor.readable.getReader();
+    const readable = processor.readable;
 
-    async function getFrameAt(time) {
-      try {
-        video.currentTime = time;
-      } catch (e) { /* ignore */ }
-      const deadline = Date.now() + FRAME_WAIT_TIMEOUT_MS;
-      while (Date.now() < deadline) {
-        const remaining = deadline - Date.now();
-        const outcome = await Promise.race([
-          reader.read(),
-          new Promise((resolve) => setTimeout(() => resolve({ timedOut: true }), remaining)),
-        ]);
-        if (outcome.timedOut) break;
-        const { value, done } = outcome;
-        if (done || !value) break;
-        const frameTime = value.timestamp / 1e6;
-        if (frameTime >= time - FRAME_MATCH_EPSILON) {
-          return { drawable: value, width: value.displayWidth || 1, height: value.displayHeight || 1, close() { value.close(); } };
-        }
-        // Stale frame from before the seek caught up — discard and keep draining.
-        value.close();
-      }
-      // Nothing matched within the deadline (shouldn't normally happen) — fall back to
-      // whatever the video element is currently showing rather than losing the sample.
-      return { drawable: video, width: video.videoWidth || 1, height: video.videoHeight || 1, close() {} };
-    }
+    const worker = new Worker(FRAME_READER_WORKER_URL);
+    let readerMsgId = 0;
+    const pending = new Map();
+    worker.addEventListener("message", (e) => {
+      const { id, ok, bitmap, error } = e.data;
+      const p = pending.get(id);
+      if (!p) return;
+      pending.delete(id);
+      if (ok) p.resolve(bitmap);
+      else p.reject(new Error(error || "Frame reader worker failed."));
+    });
+    worker.addEventListener("error", (e) => {
+      // Reject every still-pending request rather than leaving callers hanging forever if
+      // the worker itself crashes (e.g. OffscreenCanvas unsupported in some edge case).
+      const err = new Error(e.message || "Frame reader worker crashed.");
+      for (const [id, p] of pending) { p.reject(err); }
+      pending.clear();
+    });
+    // Message order is preserved within one worker, so every "getFrame" sent after this is
+    // guaranteed to be handled after the reader is set up — no separate ready-handshake
+    // needed.
+    worker.postMessage({ type: "init", readable }, [readable]);
 
     return {
-      getFrameAt,
+      getBitmap(time, mode, size) {
+        try {
+          video.currentTime = time;
+        } catch (e) { /* ignore */ }
+        return new Promise((resolve, reject) => {
+          const id = ++readerMsgId;
+          pending.set(id, { resolve, reject });
+          worker.postMessage({ type: "getFrame", id, time, mode, size });
+        });
+      },
       destroy() {
-        try { reader.cancel(); } catch (e) { /* ignore */ }
+        try { worker.terminate(); } catch (e) { /* ignore */ }
         try { track.stop(); } catch (e) { /* ignore */ }
       },
     };
   }
 
   // Fallback for browsers without MediaStreamTrackProcessor support — the original
-  // seek-and-read-directly-off-the-video-element approach. Still correct in the foreground;
-  // still vulnerable to the background-tab stall the stream-based source exists to avoid.
+  // seek-and-draw-directly-from-the-video-element approach, all on the main thread. Still
+  // correct in the foreground; still vulnerable to the background-tab stall the stream-based
+  // source exists to avoid.
   function createSeekFrameSource(video) {
+    const canvas = document.createElement("canvas");
+    canvas.width = IMAGE_SIZE;
+    canvas.height = IMAGE_SIZE;
+    const ctx = canvas.getContext("2d");
+    const nudenetCanvas = document.createElement("canvas");
+    nudenetCanvas.width = NUDENET_INPUT_SIZE;
+    nudenetCanvas.height = NUDENET_INPUT_SIZE;
+    const nudenetCtx = nudenetCanvas.getContext("2d");
+
     return {
-      async getFrameAt(time) {
+      async getBitmap(time, mode, size) {
         await seekTo(video, time);
-        return { drawable: video, width: video.videoWidth || 1, height: video.videoHeight || 1, close() {} };
+        if (mode === "letterbox") return grabLetterboxBitmap(video, nudenetCanvas, nudenetCtx, size);
+        return grabBitmap(video, canvas, ctx);
       },
       destroy() {},
     };
@@ -359,10 +377,10 @@
     return createSeekFrameSource(video);
   }
 
-  // Seeks to each of `times` (ascending), captures a frame via `captureFn(frame)`, and
-  // classifies it via `classifyFn(pool, bitmap)` — pipelined: seeking the next frame
-  // doesn't wait for the previous frame's classification to finish, up to a small bounded
-  // number of in-flight calls across the worker pool at once. Returns
+  // Seeks to each of `times` (ascending), captures a bitmap via `captureFn(frameSource,
+  // time)`, and classifies it via `classifyFn(pool, bitmap)` — pipelined: seeking the next
+  // frame doesn't wait for the previous frame's classification to finish, up to a small
+  // bounded number of in-flight calls across the worker pool at once. Returns
   // `{time, ...classifyFn's result}` samples sorted by time (completion order isn't
   // guaranteed).
   async function sampleAtTimes(frameSource, times, pool, captureFn, classifyFn, opts = {}) {
@@ -373,9 +391,8 @@
 
     for (const time of times) {
       if (token && token.cancelled) break;
-      const frame = await frameSource.getFrameAt(time);
-      const bitmap = await captureFn(frame);
-      frame.close();
+      const bitmap = await captureFn(frameSource, time);
+      if (!bitmap) continue; // no frame arrived for this time (see frame-reader-worker.js) — skip it
       const p = classifyFn(pool, bitmap).then((data) => {
         const sample = Object.assign({ time }, data);
         results.push(sample);
@@ -428,10 +445,9 @@
 
   // Plain, uniform-interval scan — the "fully thorough" option. `classifyFn` is whichever
   // classifier (NSFWJS or NudeNet) is acting as the primary/only detector for this scan.
-  // `captureFn(frame)` grabs and returns a Promise<ImageBitmap> for a frame object from
-  // frameSource.getFrameAt() — callers pick which one (square-stretch for NSFWJS,
-  // letterboxed for NudeNet; see grabBitmap/grabLetterboxBitmap below and where
-  // scanVideoFile constructs each).
+  // `captureFn(frameSource, time)` grabs and returns a Promise<ImageBitmap> for the frame at
+  // `time` — callers pick which one (square-stretch for NSFWJS, letterboxed for NudeNet;
+  // see where scanVideoFile constructs each).
   async function scanUniform(frameSource, captureFn, duration, interval, pool, classifyFn, opts) {
     const times = buildUniformTimes(duration, interval);
     let done = 0;
@@ -445,12 +461,13 @@
   }
 
   // Plain stretch-to-fill capture — used for NSFWJS's 224x224 square crop, where mild
-  // aspect distortion has always been an accepted simplification. `frame` is the object
-  // returned by frameSource.getFrameAt() — {drawable, width, height, close()}.
-  function grabBitmap(frame, canvas, ctx) {
+  // aspect distortion has always been an accepted simplification. Only used by
+  // createSeekFrameSource's fallback path now — the stream-based path does the equivalent
+  // work inside frame-reader-worker.js instead, off the main thread.
+  function grabBitmap(video, canvas, ctx) {
     const width = canvas.width;
     const height = canvas.height;
-    ctx.drawImage(frame.drawable, 0, 0, width, height);
+    ctx.drawImage(video, 0, 0, width, height);
     return createImageBitmap(canvas, { resizeWidth: width, resizeHeight: height });
   }
 
@@ -477,13 +494,14 @@
     return { newW, newH, padLeft, padTop };
   }
 
-  function grabLetterboxBitmap(frame, canvas, ctx, size) {
-    const vw = frame.width || 1;
-    const vh = frame.height || 1;
+  // Only used by createSeekFrameSource's fallback path now — see grabBitmap's comment above.
+  function grabLetterboxBitmap(video, canvas, ctx, size) {
+    const vw = video.videoWidth || 1;
+    const vh = video.videoHeight || 1;
     const { newW, newH, padLeft, padTop } = letterboxGeometry(vw, vh, size);
     ctx.fillStyle = "black";
     ctx.fillRect(0, 0, size, size);
-    ctx.drawImage(frame.drawable, 0, 0, vw, vh, padLeft, padTop, newW, newH);
+    ctx.drawImage(video, 0, 0, vw, vh, padLeft, padTop, newW, newH);
     return createImageBitmap(canvas, { resizeWidth: size, resizeHeight: size });
   }
 
@@ -830,12 +848,6 @@
     video.style.height = "1px";
     document.body.appendChild(video);
 
-    const canvas = document.createElement("canvas");
-    canvas.width = IMAGE_SIZE;
-    canvas.height = IMAGE_SIZE;
-    // No willReadFrequently here: we hand frames off via createImageBitmap(), not
-    // getImageData(), so letting the 2D context stay GPU-backed is faster.
-    const ctx = canvas.getContext("2d");
     let frameSource = null;
 
     try {
@@ -858,20 +870,16 @@
         : Math.min(3, Math.max(0.5, duration / sampleTarget));
 
       // See createFrameSource's own comment for why this replaces directly seeking+reading
-      // `video` — in short, this keeps working when the tab is backgrounded, which the old
-      // approach did not.
+      // `video` — in short, this keeps working (and keeps the main thread free of per-frame
+      // canvas work) when the tab is backgrounded, which the old approach did not.
       frameSource = createFrameSource(video);
 
-      // Needed for NudeNet (confirmation or primary): a letterboxed square, matching what
-      // the ONNX model expects (see grabLetterboxBitmap) — distorting the aspect ratio via
-      // plain stretch, like the NSFWJS crop does, would depart from how this model was
-      // trained/preprocessed. Cheap enough to always set up.
-      const nudenetCanvas = document.createElement("canvas");
-      nudenetCanvas.width = NUDENET_INPUT_SIZE;
-      nudenetCanvas.height = NUDENET_INPUT_SIZE;
-      const nudenetCtx = nudenetCanvas.getContext("2d");
-      const nsfwCaptureFn = (frame) => grabBitmap(frame, canvas, ctx);
-      const nudenetCaptureFn = (frame) => grabLetterboxBitmap(frame, nudenetCanvas, nudenetCtx, NUDENET_INPUT_SIZE);
+      // "stretch": plain resize, for NSFWJS's 224x224 crop (mild aspect distortion is an
+      // accepted simplification there). "letterbox": aspect-preserving + black-padded, for
+      // NudeNet — distorting the aspect ratio via plain stretch would depart from how that
+      // model was trained/preprocessed (see letterboxGeometry's comment).
+      const nsfwCaptureFn = (fs, time) => fs.getBitmap(time, "stretch", IMAGE_SIZE);
+      const nudenetCaptureFn = (fs, time) => fs.getBitmap(time, "letterbox", NUDENET_INPUT_SIZE);
 
       const primaryProgress = usesNudeNetConfirm
         ? (p) => { if (onProgress) onProgress(p * 0.8); }

@@ -241,12 +241,9 @@
         //
         // Neither is guaranteed to fire while the tab is in the background — both are tied
         // to the rendering/compositor pipeline, which gets throttled or paused entirely when
-        // hidden (reproduced directly: scanning a backgrounded tab froze completely, because
-        // this promise never resolved). The timer below is the actual fix: it guarantees
-        // this seek resolves regardless, so a backgrounded scan keeps making progress
-        // — worst case capturing a frame slightly before its paint is confirmed, rather than
-        // hanging forever. In the normal foreground case it's inert: the frame-ready signal
-        // above almost always wins the race well under this timeout.
+        // hidden. The timer below guarantees this seek resolves regardless, so this fallback
+        // path degrades gracefully rather than hanging outright — but see createFrameSource
+        // below for the actually-reliable fix used when the browser supports it.
         fallbackTimer = setTimeout(finish, 300);
         if (video.requestVideoFrameCallback) {
           video.requestVideoFrameCallback(finish);
@@ -265,13 +262,110 @@
     });
   }
 
-  // Seeks to each of `times` (ascending), captures a frame via `captureFn(video)`, and
+  // Whether video.captureStream() + MediaStreamTrackProcessor are available — see
+  // createFrameSource below for why this matters. Chrome/Edge only as of when this was
+  // written; Firefox/Safari fall back to the plain seekTo()-based path.
+  const SUPPORTS_STREAM_CAPTURE =
+    typeof MediaStreamTrackProcessor !== "undefined" && typeof HTMLVideoElement !== "undefined" &&
+    typeof HTMLVideoElement.prototype.captureStream === "function";
+
+  // How far a delivered VideoFrame's timestamp may land *before* the requested seek time
+  // and still count as "the frame for this sample" — seeking generally lands on the nearest
+  // available frame boundary rather than exactly the requested time, so some slack is
+  // needed; kept small relative to the smallest allowed scan interval (0.1s) so it can't
+  // accidentally match a neighboring sample's frame instead.
+  const FRAME_MATCH_EPSILON = 0.03;
+  const FRAME_WAIT_TIMEOUT_MS = 1000;
+
+  // Every sampling function below (scanUniform, scanAdaptive, classifyRunsWithDedup,
+  // confirmWithNudeNet, sampleAtTimes) takes a `frameSource` instead of a raw <video> —
+  // `frameSource.getFrameAt(time)` resolves to `{drawable, width, height, close()}`, where
+  // `drawable` is whatever ctx.drawImage() should read (a VideoFrame or the video element
+  // itself, depending on which implementation below is active) and close() releases it.
+  //
+  // Why this exists: the original approach (seekTo, above) waits on
+  // requestAnimationFrame/requestVideoFrameCallback to confirm a seeked frame is actually
+  // decoded before reading it — both are tied to the render/compositor pipeline, which gets
+  // throttled or paused when the tab is backgrounded, freezing the scan (reproduced
+  // directly). video.captureStream() + MediaStreamTrackProcessor instead pulls decoded
+  // VideoFrames through a ReadableStream driven by the *media* pipeline, which browsers
+  // deliberately keep running in the background (the same reason a video call or screen
+  // recording doesn't freeze when you switch tabs) — confirmed directly: capturing this way
+  // produces identical, correct frames whether requestAnimationFrame/
+  // requestVideoFrameCallback fire normally or are both forced to never fire at all (i.e.
+  // exactly what background-tab throttling does to them).
+  function createStreamFrameSource(video) {
+    const stream = video.captureStream();
+    const track = stream.getVideoTracks()[0];
+    const processor = new MediaStreamTrackProcessor({ track });
+    const reader = processor.readable.getReader();
+
+    async function getFrameAt(time) {
+      try {
+        video.currentTime = time;
+      } catch (e) { /* ignore */ }
+      const deadline = Date.now() + FRAME_WAIT_TIMEOUT_MS;
+      while (Date.now() < deadline) {
+        const remaining = deadline - Date.now();
+        const outcome = await Promise.race([
+          reader.read(),
+          new Promise((resolve) => setTimeout(() => resolve({ timedOut: true }), remaining)),
+        ]);
+        if (outcome.timedOut) break;
+        const { value, done } = outcome;
+        if (done || !value) break;
+        const frameTime = value.timestamp / 1e6;
+        if (frameTime >= time - FRAME_MATCH_EPSILON) {
+          return { drawable: value, width: value.displayWidth || 1, height: value.displayHeight || 1, close() { value.close(); } };
+        }
+        // Stale frame from before the seek caught up — discard and keep draining.
+        value.close();
+      }
+      // Nothing matched within the deadline (shouldn't normally happen) — fall back to
+      // whatever the video element is currently showing rather than losing the sample.
+      return { drawable: video, width: video.videoWidth || 1, height: video.videoHeight || 1, close() {} };
+    }
+
+    return {
+      getFrameAt,
+      destroy() {
+        try { reader.cancel(); } catch (e) { /* ignore */ }
+        try { track.stop(); } catch (e) { /* ignore */ }
+      },
+    };
+  }
+
+  // Fallback for browsers without MediaStreamTrackProcessor support — the original
+  // seek-and-read-directly-off-the-video-element approach. Still correct in the foreground;
+  // still vulnerable to the background-tab stall the stream-based source exists to avoid.
+  function createSeekFrameSource(video) {
+    return {
+      async getFrameAt(time) {
+        await seekTo(video, time);
+        return { drawable: video, width: video.videoWidth || 1, height: video.videoHeight || 1, close() {} };
+      },
+      destroy() {},
+    };
+  }
+
+  function createFrameSource(video) {
+    if (SUPPORTS_STREAM_CAPTURE) {
+      try {
+        return createStreamFrameSource(video);
+      } catch (e) {
+        console.warn("Stream-based frame capture failed to initialize, falling back to seek-based capture.", e);
+      }
+    }
+    return createSeekFrameSource(video);
+  }
+
+  // Seeks to each of `times` (ascending), captures a frame via `captureFn(frame)`, and
   // classifies it via `classifyFn(pool, bitmap)` — pipelined: seeking the next frame
   // doesn't wait for the previous frame's classification to finish, up to a small bounded
   // number of in-flight calls across the worker pool at once. Returns
   // `{time, ...classifyFn's result}` samples sorted by time (completion order isn't
   // guaranteed).
-  async function sampleAtTimes(video, times, pool, captureFn, classifyFn, opts = {}) {
+  async function sampleAtTimes(frameSource, times, pool, captureFn, classifyFn, opts = {}) {
     const { token, onSampleDone } = opts;
     const results = [];
     const inFlight = [];
@@ -279,10 +373,10 @@
 
     for (const time of times) {
       if (token && token.cancelled) break;
-      await seekTo(video, time);
-      const bitmap = await captureFn(video);
+      const frame = await frameSource.getFrameAt(time);
+      const bitmap = await captureFn(frame);
+      frame.close();
       const p = classifyFn(pool, bitmap).then((data) => {
-        console.log('data', data, time)
         const sample = Object.assign({ time }, data);
         results.push(sample);
         if (onSampleDone) onSampleDone(sample);
@@ -334,13 +428,14 @@
 
   // Plain, uniform-interval scan — the "fully thorough" option. `classifyFn` is whichever
   // classifier (NSFWJS or NudeNet) is acting as the primary/only detector for this scan.
-  // `captureFn(video)` grabs and returns a Promise<ImageBitmap> for the current frame —
-  // callers pick which one (square-stretch for NSFWJS, letterboxed for NudeNet; see
-  // grabBitmap/grabLetterboxBitmap below and where scanVideoFile constructs each).
-  async function scanUniform(video, captureFn, duration, interval, pool, classifyFn, opts) {
+  // `captureFn(frame)` grabs and returns a Promise<ImageBitmap> for a frame object from
+  // frameSource.getFrameAt() — callers pick which one (square-stretch for NSFWJS,
+  // letterboxed for NudeNet; see grabBitmap/grabLetterboxBitmap below and where
+  // scanVideoFile constructs each).
+  async function scanUniform(frameSource, captureFn, duration, interval, pool, classifyFn, opts) {
     const times = buildUniformTimes(duration, interval);
     let done = 0;
-    return sampleAtTimes(video, times, pool, captureFn, classifyFn, {
+    return sampleAtTimes(frameSource, times, pool, captureFn, classifyFn, {
       token: opts.token,
       onSampleDone: () => {
         done++;
@@ -350,11 +445,12 @@
   }
 
   // Plain stretch-to-fill capture — used for NSFWJS's 224x224 square crop, where mild
-  // aspect distortion has always been an accepted simplification.
-  function grabBitmap(video, canvas, ctx) {
+  // aspect distortion has always been an accepted simplification. `frame` is the object
+  // returned by frameSource.getFrameAt() — {drawable, width, height, close()}.
+  function grabBitmap(frame, canvas, ctx) {
     const width = canvas.width;
     const height = canvas.height;
-    ctx.drawImage(video, 0, 0, width, height);
+    ctx.drawImage(frame.drawable, 0, 0, width, height);
     return createImageBitmap(canvas, { resizeWidth: width, resizeHeight: height });
   }
 
@@ -381,13 +477,13 @@
     return { newW, newH, padLeft, padTop };
   }
 
-  function grabLetterboxBitmap(video, canvas, ctx, size) {
-    const vw = video.videoWidth || 1;
-    const vh = video.videoHeight || 1;
+  function grabLetterboxBitmap(frame, canvas, ctx, size) {
+    const vw = frame.width || 1;
+    const vh = frame.height || 1;
     const { newW, newH, padLeft, padTop } = letterboxGeometry(vw, vh, size);
     ctx.fillStyle = "black";
     ctx.fillRect(0, 0, size, size);
-    ctx.drawImage(video, 0, 0, vw, vh, padLeft, padTop, newW, newH);
+    ctx.drawImage(frame.drawable, 0, 0, vw, vh, padLeft, padTop, newW, newH);
     return createImageBitmap(canvas, { resizeWidth: size, resizeHeight: size });
   }
 
@@ -433,7 +529,7 @@
   // candidates within one refine window into a handful of representatives (see
   // classifyRunsWithDedup) — worth it when `classifyFn` itself is expensive per call
   // (NudeNet), not worth the added imprecision when it's cheap (NSFWJS).
-  async function scanAdaptive(video, captureFn, duration, fineInterval, pool, classifyFn, opts) {
+  async function scanAdaptive(frameSource, captureFn, duration, fineInterval, pool, classifyFn, opts) {
     const sensitivity = typeof opts.sensitivity === "number" ? opts.sensitivity : 0.6;
     // Coarse pass runs at ~5x the fine interval, but never below 2x it (so "coarse" stays
     // meaningfully coarser than "fine" — the whole point of doing two passes) or below an
@@ -448,7 +544,7 @@
     if (opts.onStatus) opts.onStatus(VMI18n.t("scan.statusCoarsePass"));
     const coarseTimes = buildUniformTimes(duration, coarseInterval);
     let coarseDone = 0;
-    const coarseSamples = await sampleAtTimes(video, coarseTimes, pool, captureFn, classifyFn, {
+    const coarseSamples = await sampleAtTimes(frameSource, coarseTimes, pool, captureFn, classifyFn, {
       token: opts.token,
       onSampleDone: () => {
         coarseDone++;
@@ -501,14 +597,14 @@
         const runEnd = run[run.length - 1].time;
         return triggerTimes.filter((t) => t >= runStart - fineInterval && t <= runEnd + fineInterval);
       });
-      fineSamples = await classifyRunsWithDedup(video, captureFn, pool, classifyFn, runs, {
+      fineSamples = await classifyRunsWithDedup(frameSource, captureFn, pool, classifyFn, runs, {
         token: opts.token,
         forcedTimesPerRun,
         onProgress: (p) => { if (opts.onProgress) opts.onProgress(50 + Math.min(50, p * 0.5)); },
       });
     } else {
       let fineDone = 0;
-      fineSamples = await sampleAtTimes(video, fineTimes, pool, captureFn, classifyFn, {
+      fineSamples = await sampleAtTimes(frameSource, fineTimes, pool, captureFn, classifyFn, {
         token: opts.token,
         onSampleDone: () => {
           fineDone++;
@@ -600,14 +696,14 @@
   // `opts.exact: true` classifies every sample individually instead (no representative
   // picking, no propagation) — for when you need the real per-sample scene-boundary time
   // rather than one approximated to the representative spacing.
-  async function classifyRunsWithDedup(video, captureFn, pool, classifyFn, runs, opts) {
+  async function classifyRunsWithDedup(frameSource, captureFn, pool, classifyFn, runs, opts) {
     const forcedTimesPerRun = opts.forcedTimesPerRun;
     const toClassify = opts.exact
       ? runs.flat()
       : runs.flatMap((run, i) => pickRepresentatives(run, MAX_CONFIRMS_PER_RUN, forcedTimesPerRun && forcedTimesPerRun[i]));
     const times = toClassify.map((c) => c.time);
     let done = 0;
-    const classified = await sampleAtTimes(video, times, pool, captureFn, classifyFn, {
+    const classified = await sampleAtTimes(frameSource, times, pool, captureFn, classifyFn, {
       token: opts.token,
       onSampleDone: () => {
         done++;
@@ -645,7 +741,7 @@
   // in the same run (0 if NudeNet found nothing in the confirm-worthy classes, its max
   // confidence among them otherwise). Samples below the floor are left as-is. See
   // js/nudenet-worker.js for exactly which classes count.
-  async function confirmWithNudeNet(video, captureFn, samples, interval, opts) {
+  async function confirmWithNudeNet(frameSource, captureFn, samples, interval, opts) {
     const candidates = samples.filter((s) => s.probability >= PREFILTER_FLOOR);
     if (!candidates.length) {
       if (opts.onProgress) opts.onProgress(100);
@@ -665,7 +761,7 @@
       opts.onStatus(VMI18n.t("scan.statusConfirming", { count: toConfirmCount, suffix }));
     }
     const pool = await getWorkerPool("nudenet", opts.onStatus, "confirmation");
-    const verdicts = await classifyRunsWithDedup(video, captureFn, pool, classifyNudeNetAsProbability, runs, opts);
+    const verdicts = await classifyRunsWithDedup(frameSource, captureFn, pool, classifyNudeNetAsProbability, runs, opts);
     const verdictByTime = new Map(verdicts.map((v) => [v.time, { probability: v.probability, label: v.label, classScores: v.classScores, classBoxes: v.classBoxes }]));
 
     const result = samples.map((s) => {
@@ -740,6 +836,7 @@
     // No willReadFrequently here: we hand frames off via createImageBitmap(), not
     // getImageData(), so letting the 2D context stay GPU-backed is faster.
     const ctx = canvas.getContext("2d");
+    let frameSource = null;
 
     try {
       await new Promise((resolve, reject) => {
@@ -760,6 +857,11 @@
         ? Math.max(0.1, sampleInterval)
         : Math.min(3, Math.max(0.5, duration / sampleTarget));
 
+      // See createFrameSource's own comment for why this replaces directly seeking+reading
+      // `video` — in short, this keeps working when the tab is backgrounded, which the old
+      // approach did not.
+      frameSource = createFrameSource(video);
+
       // Needed for NudeNet (confirmation or primary): a letterboxed square, matching what
       // the ONNX model expects (see grabLetterboxBitmap) — distorting the aspect ratio via
       // plain stretch, like the NSFWJS crop does, would depart from how this model was
@@ -768,8 +870,8 @@
       nudenetCanvas.width = NUDENET_INPUT_SIZE;
       nudenetCanvas.height = NUDENET_INPUT_SIZE;
       const nudenetCtx = nudenetCanvas.getContext("2d");
-      const nsfwCaptureFn = (v) => grabBitmap(v, canvas, ctx);
-      const nudenetCaptureFn = (v) => grabLetterboxBitmap(v, nudenetCanvas, nudenetCtx, NUDENET_INPUT_SIZE);
+      const nsfwCaptureFn = (frame) => grabBitmap(frame, canvas, ctx);
+      const nudenetCaptureFn = (frame) => grabLetterboxBitmap(frame, nudenetCanvas, nudenetCtx, NUDENET_INPUT_SIZE);
 
       const primaryProgress = usesNudeNetConfirm
         ? (p) => { if (onProgress) onProgress(p * 0.8); }
@@ -778,26 +880,26 @@
       let samples;
       if (usesNudeNetPrimary) {
         if (adaptive) {
-          samples = await scanAdaptive(video, nudenetCaptureFn, duration, interval, pool, classifyNudeNetAsProbability, {
+          samples = await scanAdaptive(frameSource, nudenetCaptureFn, duration, interval, pool, classifyNudeNetAsProbability, {
             token, onProgress: primaryProgress, onStatus, sensitivity, dedupFinePass: !exactTiming,
           });
         } else {
           if (onStatus) onStatus(VMI18n.t("scan.statusScanningFramesNudenet"));
-          samples = await scanUniform(video, nudenetCaptureFn, duration, interval, pool, classifyNudeNetAsProbability, {
+          samples = await scanUniform(frameSource, nudenetCaptureFn, duration, interval, pool, classifyNudeNetAsProbability, {
             token, onProgress: primaryProgress,
           });
         }
       } else {
         if (adaptive) {
-          samples = await scanAdaptive(video, nsfwCaptureFn, duration, interval, pool, classifyNSFW, { token, onProgress: primaryProgress, onStatus, sensitivity });
+          samples = await scanAdaptive(frameSource, nsfwCaptureFn, duration, interval, pool, classifyNSFW, { token, onProgress: primaryProgress, onStatus, sensitivity });
         } else {
           if (onStatus) onStatus(VMI18n.t("scan.statusScanningFrames"));
-          samples = await scanUniform(video, nsfwCaptureFn, duration, interval, pool, classifyNSFW, { token, onProgress: primaryProgress });
+          samples = await scanUniform(frameSource, nsfwCaptureFn, duration, interval, pool, classifyNSFW, { token, onProgress: primaryProgress });
         }
 
         if (!(token && token.cancelled) && usesNudeNetConfirm) {
           const confirmProgress = (p) => { if (onProgress) onProgress(80 + p * 0.2); };
-          samples = await confirmWithNudeNet(video, nudenetCaptureFn, samples, interval, { token, onProgress: confirmProgress, onStatus, exact: exactTiming });
+          samples = await confirmWithNudeNet(frameSource, nudenetCaptureFn, samples, interval, { token, onProgress: confirmProgress, onStatus, exact: exactTiming });
         }
       }
 
@@ -810,6 +912,7 @@
 
       return { samples, duration, interval };
     } finally {
+      if (frameSource) frameSource.destroy();
       video.pause();
       video.removeAttribute("src");
       video.load();

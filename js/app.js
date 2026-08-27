@@ -34,7 +34,7 @@
     classThresholds: defaultClassThresholds(),
     blurAdvance: 1.5,
     rememberState: true,
-    scanInterval: 0.2,
+    scanInterval: 0.05,
     adaptiveScan: true,
     // "nsfwjs": NSFWJS only. "confirm": NSFWJS scans, NudeNet double-checks what it flags.
     // "nudenet": NudeNet is the primary/only classifier for every sampled frame.

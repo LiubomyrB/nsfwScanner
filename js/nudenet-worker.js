@@ -154,6 +154,7 @@ async function detect(session, bitmap, minScore) {
   const parts = [];
   for (const i of keep) {
     const classId = classIds[i];
+    console.log('label', LABELS[classId])
     if (CONFIRM_IDS.includes(classId)) {
       const label = LABELS[classId];
       const box = boxes[i];
@@ -168,12 +169,139 @@ async function detect(session, bitmap, minScore) {
       }
     }
   }
-  //console.log('scores', scores, classScores, parts)
+
+  console.log('scores', scores, parts)
   return { matched: parts.length > 0, maxScore: maxConfirmScore, label: maxConfirmLabel, classScores, classBoxes, parts };
 }
 
+// --- Stream + coordinator-port protocol -----------------------------------------------
+// Lets this worker read decoded frames directly off a MediaStreamTrackProcessor's stream
+// (transferred in from scanner.js — see createStreamFrameSource there) and classify them by
+// requested time, talking directly to a scan-coordinator-worker.js instance over a private
+// MessagePort — no main-thread involvement in that round trip at all. This is what actually
+// keeps a NudeNet-primary scan running at full speed when the tab is backgrounded: the
+// scan's own pacing loop lives in the coordinator worker (not on the main thread, which the
+// browser deprioritizes when hidden), and frame acquisition happens here, off the main
+// thread too — the main thread's only remaining job is applying `video.currentTime = time`
+// seek commands, since only it has the actual <video> element.
+let streamReader = null;
+let coordinatorPort = null;
+
+const FRAME_MATCH_EPSILON = 0.03;
+const FRAME_WAIT_TIMEOUT_MS = 1000;
+
+// Drains the stream until a frame at/after `time` (within FRAME_MATCH_EPSILON) arrives,
+// discarding stale (pre-seek) frames along the way — same logic as frame-reader-worker.js,
+// duplicated here rather than shared (no module system across the worker boundary in this
+// classic-script app). Returns null if nothing matches within the deadline.
+async function getFrameAt(time) {
+    console.log('getFrameAt START', time)
+  const deadline = Date.now() + FRAME_WAIT_TIMEOUT_MS;
+  while (Date.now() < deadline) {
+    const remaining = deadline - Date.now();
+    const outcome = await Promise.race([
+      streamReader.read(),
+      new Promise((resolve) => setTimeout(() => resolve({ timedOut: true }), remaining)),
+    ]);
+    if (outcome.timedOut) {
+
+        console.log('getFrameAt timedOut', time)
+        break;
+    }
+    const { value, done } = outcome;
+    if (done || !value) break;
+    
+    const frameTime = value.timestamp / 1e6;
+    if (frameTime >= time - FRAME_MATCH_EPSILON) {
+        console.log('getFrameAt value', time, value)
+        return value;
+    }
+    value.close();
+  }
+  return null;
+}
+
+function letterboxGeometry(vw, vh, size) {
+  const aspect = vw / vh;
+  let newW, newH;
+  if (vh > vw) {
+    newH = size;
+    newW = Math.round(size * aspect);
+  } else {
+    newW = size;
+    newH = Math.round(size / aspect);
+  }
+  const padLeft = Math.floor((size - newW) / 2);
+  const padTop = Math.floor((size - newH) / 2);
+  return { newW, newH, padLeft, padTop };
+}
+
+// Same letterbox treatment as scanner.js's grabLetterboxBitmap, just reading straight from
+// a VideoFrame pulled off the stream instead of a <video> element, and staying entirely in
+// this worker (no canvas/bitmap hop back through the main thread).
+async function detectAtTime(time, minScore) {
+  const frame = await getFrameAt(time);
+  if (!frame) return null;
+  const vw = frame.displayWidth || 1;
+  const vh = frame.displayHeight || 1;
+  const { newW, newH, padLeft, padTop } = letterboxGeometry(vw, vh, INPUT_SIZE);
+  const canvas = new OffscreenCanvas(INPUT_SIZE, INPUT_SIZE);
+  const ctx = canvas.getContext("2d");
+  ctx.fillStyle = "black";
+  ctx.fillRect(0, 0, INPUT_SIZE, INPUT_SIZE);
+  ctx.drawImage(frame, 0, 0, vw, vh, padLeft, padTop, newW, newH);
+  frame.close();
+  const bitmap = await createImageBitmap(canvas);
+  const session = await getSession();
+  const result = await detect(session, bitmap, minScore);
+  bitmap.close();
+  return result;
+}
+
+// Requests arrive one at a time in practice (the coordinator awaits each full round trip
+// before sending the next — seeking has to stay strictly sequential, since the stream can
+// only ever reflect one <video>.currentTime at a time), but queue defensively rather than
+// assume that: overlapping reader.read() calls on the same stream would corrupt matching.
+let classifyChain = Promise.resolve();
+function handleCoordinatorClassify(req) {
+  classifyChain = classifyChain
+    .then(() => detectAtTime(req.time, typeof req.minScore === "number" ? req.minScore : 0.2))
+    .then((result) => {
+      if (!result) {
+        coordinatorPort.postMessage({ id: req.id, ok: true, empty: true });
+      } else {
+        coordinatorPort.postMessage({ id: req.id, ok: true, ...result });
+      }
+    })
+    .catch((err) => {
+      coordinatorPort.postMessage({ id: req.id, ok: false, error: String((err && err.message) || err) });
+    });
+}
+
 self.onmessage = async (e) => {
-  const { id, bitmap, minScore } = e.data;
+  const msg = e.data;
+
+  if (msg && msg.type === "initStream") {
+    // A reused worker (see scanner.js's getCoordinatedNudenetWorker) gets a fresh stream
+    // every scan — release whatever the previous scan's reader was still holding first.
+    if (streamReader) {
+      try { streamReader.cancel(); } catch (e) { /* ignore */ }
+    }
+    streamReader = msg.readable.getReader();
+    return;
+  }
+  if (msg && msg.type === "initCoordinatorPort") {
+    coordinatorPort = msg.port;
+    coordinatorPort.onmessage = (ev) => {
+      if (ev.data && ev.data.type === "classify") handleCoordinatorClassify(ev.data);
+    };
+    return;
+  }
+
+  // Original protocol: classify one already-captured bitmap (used by the pool-based
+  // dispatch path — scanner.js's confirmWithNudeNet / NudeNet-as-confirmation, and the
+  // NSFWJS/"confirm" detection modes generally, which stay on that architecture).
+  const { id, bitmap, minScore } = msg;
   try {
     const session = await getSession();
     const result = await detect(session, bitmap, typeof minScore === "number" ? minScore : 0.2);

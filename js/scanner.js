@@ -78,6 +78,7 @@
     nudenet: new URL("./nudenet-worker.js", scriptBase).href,
   };
   const FRAME_READER_WORKER_URL = new URL("./frame-reader-worker.js", scriptBase).href;
+  const SCAN_COORDINATOR_WORKER_URL = new URL("./scan-coordinator-worker.js", scriptBase).href;
 
   const pools = { nsfw: null, nudenet: null };
   const rrCounters = { nsfw: 0, nudenet: 0 };
@@ -213,8 +214,14 @@
   function createCancelToken() {
     return {
       cancelled: false,
+      // Optional callback a caller can attach for an immediate side effect on cancel — used
+      // by runCoordinatedNudeNetScan to forward cancellation straight to the coordinator
+      // worker, rather than relying on it to notice a shared flag it can't actually observe
+      // (workers don't share JS object references with the main thread).
+      onCancel: null,
       cancel() {
         this.cancelled = true;
+        if (this.onCancel) this.onCancel();
       },
     };
   }
@@ -795,6 +802,118 @@
     return result;
   }
 
+  // Module-level singleton, same reasoning as the `pools` map above (avoid re-paying
+  // worker-startup + ~12MB model-load cost on every scan/rescan) — but this one is driven
+  // directly by scan-coordinator-worker.js over a dedicated port instead of through
+  // getWorkerPool's round-robin dispatch, so it's tracked separately.
+  let coordinatedNudenetWorker = null;
+  let coordinatedNudenetReady = null;
+
+  function getCoordinatedNudenetWorker(onStatus) {
+    if (!coordinatedNudenetWorker) {
+      coordinatedNudenetWorker = new Worker(WORKER_URLS.nudenet);
+      if (onStatus) onStatus(VMI18n.t("scan.statusStartingWorkers", { count: 1, role: VMI18n.t("scan.workerRole.detector") }));
+      coordinatedNudenetReady = new Promise((resolve, reject) => {
+        const timer = setTimeout(() => reject(new Error("Timed out waiting for the nudenet worker to start.")), 90000);
+        function onMessage(e) {
+          if (!e.data || !e.data.ready) return;
+          clearTimeout(timer);
+          coordinatedNudenetWorker.removeEventListener("message", onMessage);
+          if (e.data.error) reject(new Error(e.data.error));
+          else resolve();
+        }
+        coordinatedNudenetWorker.addEventListener("message", onMessage);
+        coordinatedNudenetWorker.addEventListener(
+          "error",
+          (e) => {
+            clearTimeout(timer);
+            reject(new Error(e.message || "nudenet worker failed to start."));
+          },
+          { once: true }
+        );
+      }).catch((e) => {
+        // Don't leave a permanently-broken worker cached — same reasoning as
+        // getWorkerPool's own catch.
+        try { coordinatedNudenetWorker.terminate(); } catch (e2) { /* ignore */ }
+        coordinatedNudenetWorker = null;
+        throw e;
+      });
+    }
+    return coordinatedNudenetReady.then(() => coordinatedNudenetWorker);
+  }
+
+  // Runs a NudeNet-primary scan (adaptive or uniform) via scan-coordinator-worker.js talking
+  // directly to the (reused) nudenet worker over a private MessagePort — see that file's own
+  // comment for why this exists instead of the frameSource-based path below: neither the
+  // scan loop's pacing (lives entirely in the coordinator worker) nor frame acquisition
+  // (lives entirely in the nudenet worker) depend on anything the main thread does, so a
+  // backgrounded tab can't deprioritize either. The main thread's only remaining role is
+  // applying seek commands (only it has the <video> element) and relaying progress/status to
+  // the DOM. Only used when SUPPORTS_STREAM_CAPTURE — see scanVideoFile.
+  async function runCoordinatedNudeNetScan(video, opts) {
+    const { duration, interval, adaptive, sensitivity, dedupFinePass, onProgress, onStatus, token } = opts;
+
+    const nudenetWorker = await getCoordinatedNudenetWorker(onStatus);
+
+    const stream = video.captureStream();
+    const track = stream.getVideoTracks()[0];
+    const processor = new MediaStreamTrackProcessor({ track });
+    const readable = processor.readable;
+
+    const coordinator = new Worker(SCAN_COORDINATOR_WORKER_URL);
+    const channel = new MessageChannel();
+    nudenetWorker.postMessage({ type: "initStream", readable }, [readable]);
+    nudenetWorker.postMessage({ type: "initCoordinatorPort", port: channel.port1 }, [channel.port1]);
+    coordinator.postMessage({ type: "nudenetPort", port: channel.port2 }, [channel.port2]);
+
+    return new Promise((resolve, reject) => {
+      let settled = false;
+      function cleanup() {
+        if (token) token.onCancel = null;
+        try { coordinator.terminate(); } catch (e) { /* ignore */ }
+        try { track.stop(); } catch (e) { /* ignore */ }
+      }
+      function finish(fn) {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        fn();
+      }
+
+      coordinator.addEventListener("error", (e) => {
+        finish(() => reject(new Error(e.message || "Scan coordinator worker failed.")));
+      });
+
+      coordinator.onmessage = (e) => {
+        const msg = e.data;
+        if (msg.type === "seek") {
+          try { video.currentTime = msg.time; } catch (err) { /* ignore */ }
+        } else if (msg.type === "progress") {
+          if (onProgress) onProgress(msg.pct);
+        } else if (msg.type === "status") {
+          if (onStatus) onStatus(VMI18n.t(msg.key, msg.params));
+        } else if (msg.type === "done") {
+          finish(() => resolve(msg.samples));
+        } else if (msg.type === "cancelled") {
+          finish(() => {
+            const err = new Error("cancelled");
+            err.cancelled = true;
+            reject(err);
+          });
+        } else if (msg.type === "error") {
+          finish(() => reject(new Error(msg.message)));
+        }
+      };
+
+      if (token) {
+        token.onCancel = () => coordinator.postMessage({ type: "cancel" });
+        if (token.cancelled) token.onCancel();
+      }
+
+      coordinator.postMessage({ type: "start", duration, interval, adaptive, sensitivity, dedupFinePass });
+    });
+  }
+
   // Scans `file` by seeking a hidden <video> element across its duration and classifying
   // a downscaled frame at each sample point (in a worker pool — see header comment).
   //
@@ -830,9 +949,16 @@
     const { onProgress, onStatus, token, sampleTarget = 240, sampleInterval, adaptive, sensitivity, detectionMode = "nsfwjs", exactTiming } = opts;
     const usesNudeNetPrimary = detectionMode === "nudenet";
     const usesNudeNetConfirm = detectionMode === "confirm";
-    const pool = usesNudeNetPrimary
-      ? await getWorkerPool("nudenet", onStatus, "detector")
-      : await getWorkerPool("nsfw", onStatus, "scan");
+    // The coordinated path (see runCoordinatedNudeNetScan) manages its own dedicated,
+    // reused nudenet worker directly — it never touches the pools/getWorkerPool
+    // round-robin dispatch, so fetching a pooled nudenet worker here too would just
+    // download the ~12MB model twice for nothing.
+    const useCoordinatedNudeNet = usesNudeNetPrimary && SUPPORTS_STREAM_CAPTURE;
+    const pool = useCoordinatedNudeNet
+      ? null
+      : usesNudeNetPrimary
+        ? await getWorkerPool("nudenet", onStatus, "detector")
+        : await getWorkerPool("nsfw", onStatus, "scan");
     if (onStatus) onStatus(VMI18n.t("scan.statusPreparingVideo"));
 
     const url = URL.createObjectURL(file);
@@ -869,11 +995,6 @@
         ? Math.max(0.1, sampleInterval)
         : Math.min(3, Math.max(0.5, duration / sampleTarget));
 
-      // See createFrameSource's own comment for why this replaces directly seeking+reading
-      // `video` — in short, this keeps working (and keeps the main thread free of per-frame
-      // canvas work) when the tab is backgrounded, which the old approach did not.
-      frameSource = createFrameSource(video);
-
       // "stretch": plain resize, for NSFWJS's 224x224 crop (mild aspect distortion is an
       // accepted simplification there). "letterbox": aspect-preserving + black-padded, for
       // NudeNet — distorting the aspect ratio via plain stretch would depart from how that
@@ -887,17 +1008,35 @@
 
       let samples;
       if (usesNudeNetPrimary) {
-        if (adaptive) {
+        if (useCoordinatedNudeNet) {
+          // See runCoordinatedNudeNetScan's own comment for why this exists — the scan
+          // loop's pacing and frame acquisition both run off the main thread entirely, so
+          // neither can be deprioritized by a backgrounded tab. No frameSource/canvas setup
+          // needed here at all; that's all internal to the coordinator + nudenet worker.
+          samples = await runCoordinatedNudeNetScan(video, {
+            duration, interval, adaptive, sensitivity, dedupFinePass: !exactTiming,
+            onProgress: primaryProgress, onStatus, token,
+          });
+        } else if (adaptive) {
+          // Fallback (no MediaStreamTrackProcessor support, e.g. Firefox/Safari) — the
+          // frameSource-based path; see createFrameSource's own comment.
+          frameSource = createFrameSource(video);
           samples = await scanAdaptive(frameSource, nudenetCaptureFn, duration, interval, pool, classifyNudeNetAsProbability, {
             token, onProgress: primaryProgress, onStatus, sensitivity, dedupFinePass: !exactTiming,
           });
         } else {
+          frameSource = createFrameSource(video);
           if (onStatus) onStatus(VMI18n.t("scan.statusScanningFramesNudenet"));
           samples = await scanUniform(frameSource, nudenetCaptureFn, duration, interval, pool, classifyNudeNetAsProbability, {
             token, onProgress: primaryProgress,
           });
         }
       } else {
+        // "nsfwjs"/"confirm" modes (not reachable through the UI currently, both hidden in
+        // favor of NudeNet-only — kept working in code) stay on the frameSource-based path:
+        // "confirm" mode needs both NSFWJS and NudeNet classifiers in the same scan, which
+        // doesn't fit the coordinator's one-dedicated-classifier-port design.
+        frameSource = createFrameSource(video);
         if (adaptive) {
           samples = await scanAdaptive(frameSource, nsfwCaptureFn, duration, interval, pool, classifyNSFW, { token, onProgress: primaryProgress, onStatus, sensitivity });
         } else {

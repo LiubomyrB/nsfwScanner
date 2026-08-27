@@ -17,6 +17,18 @@
   const REF_MARGIN = 260;
   const REF_SPACING = 1;
 
+  // Countdown-warning style (generateCountdown, below) — a plain readable subtitle line
+  // rather than an intertitle card, so its own reference metrics are smaller/simpler.
+  const COUNTDOWN_REF_FONTSIZE = 56;
+  const COUNTDOWN_REF_MARGIN_LR = 80;
+  const COUNTDOWN_REF_MARGIN_V = 60;
+  const COUNTDOWN_REF_SPACING = 0.5;
+  // How many times longer than "Blur in advance" the countdown warning tries to lead a
+  // scene by — e.g. a 2s blurAdvance means the countdown normally starts 6s before the
+  // scene. Capped shorter (see generateCountdown) when the previous scene ended too
+  // recently to fit the full lead time without overlapping it.
+  const COUNTDOWN_LEAD_MULTIPLE = 3;
+
   // layer/style/draw exactly as in the reference template (see project notes) — draw
   // commands use ASS's vector drawing mini-language ("m x y" = move-to, "l x y..." = one or
   // more line-to points), all in the 1920x1080 reference space.
@@ -162,5 +174,78 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
     return header + lines.join("\n") + "\n";
   }
 
-  global.VMAssExport = { generate };
+  // Alternative to generate() above: instead of covering the frame, shows a small text line
+  // counting down the seconds until each scene starts ("Please blur scene in N seconds"),
+  // ticking N down every second, then disappearing exactly when the scene begins — this
+  // style never covers or otherwise touches the actual scene itself, it's purely a heads-up
+  // beforehand.
+  //
+  // The countdown normally starts COUNTDOWN_LEAD_MULTIPLE x `blurAdvance` seconds before a
+  // scene (mirroring the app's own "Blur in advance" setting as the base unit), but is
+  // shortened if the previous scene ended too recently for that full lead time to fit
+  // without overlapping it — capped to whatever gap is actually available, per scene.
+  // `segments`/`videoWidth`/`videoHeight` mean the same as in generate() above.
+  function generateCountdown(videoWidth, videoHeight, segments, blurAdvance) {
+    const w = Math.max(1, Math.round(videoWidth) || REF_WIDTH);
+    const h = Math.max(1, Math.round(videoHeight) || REF_HEIGHT);
+    const scaleX = w / REF_WIDTH;
+    const scaleY = h / REF_HEIGHT;
+    const advance = Math.max(0, blurAdvance || 0);
+    const leadCap = advance * COUNTDOWN_LEAD_MULTIPLE;
+
+    const fontsize = Math.max(1, Math.round(COUNTDOWN_REF_FONTSIZE * scaleY));
+    const marginLR = Math.max(0, Math.round(COUNTDOWN_REF_MARGIN_LR * scaleX));
+    const marginV = Math.max(0, Math.round(COUNTDOWN_REF_MARGIN_V * scaleY));
+    const spacing = (COUNTDOWN_REF_SPACING * scaleX).toFixed(1);
+
+    const header = `[Script Info]
+ScriptType: v4.00+
+PlayResX: ${w}
+PlayResY: ${h}
+ScaledBorderAndShadow: yes
+WrapStyle: 2
+
+[V4+ Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+Style: Warning,Arial,${fontsize},&H0007C1FF,&H00000000,&H00000000,&H00000000,1,0,0,0,100,100,${spacing},0,1,3,1,2,${marginLR},${marginLR},${marginV},1
+
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+`;
+
+    // Raw (unpadded) scene windows, merged so touching/overlapping detections count as one
+    // continuous stretch when measuring the gap available before each one.
+    const windows = mergeWindows((segments || []).map((seg) => ({ start: seg.start, end: seg.end })));
+
+    const lines = [];
+    let prevEnd = 0;
+    for (const win of windows) {
+      const gap = Math.max(0, win.start - prevEnd);
+      const leadTime = Math.min(leadCap, gap);
+      if (leadTime > 0) {
+        const warnStart = win.start - leadTime;
+        const maxN = Math.ceil(leadTime);
+        // Counts down from maxN to 1, one Dialogue line per second boundary — the first
+        // (highest-N) line is shorter than a full second whenever leadTime isn't a whole
+        // number, since there's nothing to show before warnStart.
+        for (let n = maxN; n >= 1; n--) {
+          const idealStart = win.start - n;
+          const idealEnd = win.start - (n - 1);
+          const clippedStart = Math.max(idealStart, warnStart);
+          const clippedEnd = Math.min(idealEnd, win.start);
+          if (clippedEnd <= clippedStart) continue;
+          const start = formatAssTime(clippedStart);
+          const end = formatAssTime(clippedEnd);
+          const text = (global.VMI18n && global.VMI18n.t("intertitle.countdownText", { count: n })) ||
+            `Please blur scene in ${n} second${n === 1 ? "" : "s"}`;
+          lines.push(`Dialogue: 0,${start},${end},Warning,,0,0,0,,${text}`);
+        }
+      }
+      prevEnd = win.end;
+    }
+
+    return header + lines.join("\n") + "\n";
+  }
+
+  global.VMAssExport = { generate, generateCountdown };
 })(window);

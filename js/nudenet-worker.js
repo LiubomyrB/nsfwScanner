@@ -168,6 +168,7 @@ async function detect(session, bitmap, minScore) {
       }
     }
   }
+  console.log('scores', scores, classScores, parts)
   return { matched: parts.length > 0, maxScore: maxConfirmScore, label: maxConfirmLabel, classScores, classBoxes, parts };
 }
 

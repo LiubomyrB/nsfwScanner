@@ -29,12 +29,32 @@
 
   function seekTo(video, time) {
     return new Promise((resolve) => {
+      let settled = false;
+      let fallbackTimer = null;
+
+      function finish() {
+        if (settled) return;
+        settled = true;
+        video.removeEventListener("seeked", onSeeked);
+        if (fallbackTimer) clearTimeout(fallbackTimer);
+        resolve();
+      }
+
       function onSeeked() {
         video.removeEventListener("seeked", onSeeked);
-        // double rAF so the decoded frame is actually painted before we read pixels — same
-        // reasoning as scanner.js's own seekTo.
-        requestAnimationFrame(() => requestAnimationFrame(resolve));
+        // Same reasoning — and same background-tab fix — as scanner.js's own seekTo: prefer
+        // requestVideoFrameCallback (or a double rAF fallback) to confirm the frame actually
+        // decoded before capturing it, but never rely on either alone, since both are tied
+        // to the render/compositor pipeline and can stall indefinitely if the tab gets
+        // backgrounded mid-capture. The timer guarantees this always resolves.
+        fallbackTimer = setTimeout(finish, 300);
+        if (video.requestVideoFrameCallback) {
+          video.requestVideoFrameCallback(finish);
+        } else {
+          requestAnimationFrame(() => requestAnimationFrame(finish));
+        }
       }
+
       video.addEventListener("seeked", onSeeked);
       try {
         video.currentTime = time;

@@ -162,13 +162,22 @@
       <h3 data-i18n="assInfoDialog.title">Save subtitle file</h3>
       <button id="assInfoCloseX" class="close-x" type="button" data-i18n-aria-label="assInfoDialog.close">&times;</button>
     </div>
-    <p data-i18n-html="assInfoDialog.textHtml">When you click "Save", pick the <strong>same folder where the video file is
+    <p data-i18n-html="assInfoDialog.textHtml">When you click "Save" below, pick the <strong>same folder where the video file is
       located</strong>, and keep the suggested file name. Most media players automatically
       load a subtitle file with the same name as the video, sitting next to it — once saved
-      there, this subtitle will automatically cover the screen when a detected scene plays,
-      even outside this app.</p>
-    <div class="dialog-actions">
-      <button id="assInfoSaveBtn" class="btn primary" data-i18n="assInfoDialog.save">Save</button>
+      there, these subtitles will play automatically alongside the video, even outside this
+      app. Choose which style to save below.</p>
+
+    <div class="ass-type-option">
+      <div class="ass-type-option-title" data-i18n="assInfoDialog.coverTitle">Full-screen cover</div>
+      <p class="hint" data-i18n="assInfoDialog.coverHint">Shows an opaque intertitle-style card over the whole frame for the duration of each scene (plus "Blur in advance" on both sides) — hides the content completely, like this app's own in-player blur.</p>
+      <button id="assInfoSaveCoverBtn" class="btn primary" data-i18n="assInfoDialog.save">Save</button>
+    </div>
+
+    <div class="ass-type-option">
+      <div class="ass-type-option-title" data-i18n="assInfoDialog.countdownTitle">Countdown warning</div>
+      <p class="hint" data-i18n="assInfoDialog.countdownHint">Shows a small heads-up text counting down the seconds until each scene starts, instead of covering anything — lets you look away or skip ahead in time rather than hiding the video.</p>
+      <button id="assInfoSaveCountdownBtn" class="btn primary" data-i18n="assInfoDialog.save">Save</button>
     </div>
   </div>
 </div>

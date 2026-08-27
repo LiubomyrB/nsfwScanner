@@ -3,27 +3,19 @@
   // The 5 NudeNet body-part classes a sample's classScores map can carry a score for (see
   // nudenet-worker.js's CONFIRM_LABELS / scanner.js's applyClassThresholds) — each gets its
   // own sensitivity slider, built dynamically (see buildClassThresholdSliders) into both the
-  // Settings dialog and the Timecodes dialog rather than hand-written 5x in each.
-  const CONFIRM_CLASSES = [
-    { key: "female-breast-bare", i18nKey: "settings.classFemaleBreastBare" },
-    { key: "female-vagina", i18nKey: "settings.classFemaleVagina" },
-    { key: "male-penis", i18nKey: "settings.classMalePenis" },
-    { key: "anus-bare", i18nKey: "settings.classAnusBare" },
-    { key: "buttocks-bare", i18nKey: "settings.classButtocksBare" },
-  ];
+  // Settings dialog and the Timecodes dialog rather than hand-written 5x in each. Single
+  // source of truth lives in scanner.js (also used there by segmentsToTxt's own class-name
+  // column) so this list and its translations can't drift between the two files.
+  const CONFIRM_CLASSES = VMScanner.CONFIRM_CLASSES;
 
-  const CONFIRM_CLASS_I18N_BY_KEY = {};
-  CONFIRM_CLASSES.forEach((c) => { CONFIRM_CLASS_I18N_BY_KEY[c.key] = c.i18nKey; });
-
-  // The human-readable class name for a snapshot grid caption (see
-  // buildSnapshotGridSkeleton) — reuses the exact same translated names as the per-class
-  // sensitivity sliders, so "female-breast-bare" reads as "Female breast" etc. Falls back to
-  // the segment's own time range for a sample with no recognized label (e.g. a legacy scan
-  // from before per-class detection existed).
-  function classCaptionText(seg) {
-    const i18nKey = seg.label && CONFIRM_CLASS_I18N_BY_KEY[seg.label];
-    if (i18nKey) return VMI18n.t(i18nKey);
-    return VMScanner.formatTime(seg.start) + " – " + VMScanner.formatTime(seg.end);
+  // "44:20, Female breast" / "1:10:15, Buttocks" — the snapshot grid's caption (see
+  // buildSnapshotGridSkeleton). Time uses the same conditional-hours format as the player's
+  // own time labels (formatControlTime). Falls back to time alone if the segment has no
+  // recognized class (e.g. a legacy scan from before per-class detection existed).
+  function snapshotCaptionText(seg) {
+    const timeStr = formatControlTime(seg.start, seg.start >= 3600);
+    const className = VMScanner.classDisplayName(seg.label);
+    return className ? `${timeStr}, ${className}` : timeStr;
   }
 
   function defaultClassThresholds() {
@@ -126,7 +118,7 @@
       "existingDialogOverlay", "existingDialogText", "useExistingBtn", "rescanBtn",
       "timecodesDialogOverlay", "timecodesStats", "classThresholdsTimecodes", "timecodesSnapshotGrid", "timecodesContent",
       "downloadTimecodesBtn", "downloadSubtitlesBtn", "closeTimecodesBtn",
-      "assInfoDialogOverlay", "assInfoCloseX", "assInfoSaveBtn",
+      "assInfoDialogOverlay", "assInfoCloseX", "assInfoSaveCoverBtn", "assInfoSaveCountdownBtn",
       "transcodeWarningOverlay", "transcodeWarningTitle", "transcodeReasonText", "transcodeFileName",
       "transcodeReasonSuffix", "transcodeConfirmBtn", "transcodeCancelBtn",
       "settingsDialogOverlay", "sensitivityInput", "sensitivityValue", "classThresholdsSettings", "blurAdvanceInput",
@@ -179,9 +171,13 @@
     els.assInfoDialogOverlay.addEventListener("click", (e) => {
       if (e.target === els.assInfoDialogOverlay) closeAssInfoDialog();
     });
-    els.assInfoSaveBtn.addEventListener("click", () => {
+    els.assInfoSaveCoverBtn.addEventListener("click", () => {
       closeAssInfoDialog();
-      void saveAssSubtitles();
+      void saveAssSubtitles("cover");
+    });
+    els.assInfoSaveCountdownBtn.addEventListener("click", () => {
+      closeAssInfoDialog();
+      void saveAssSubtitles("countdown");
     });
 
     document.addEventListener("keydown", (e) => {
@@ -502,7 +498,7 @@
 
       const timeLabel = document.createElement("div");
       timeLabel.className = "snapshot-time";
-      timeLabel.textContent = classCaptionText(seg);
+      timeLabel.textContent = snapshotCaptionText(seg);
       // Still available on hover for anyone who wants the exact moment, without cluttering
       // the caption itself.
       timeLabel.title = VMScanner.formatTime(seg.start) + " – " + VMScanner.formatTime(seg.end);
@@ -581,13 +577,16 @@
     return { width: els.video.videoWidth, height: els.video.videoHeight };
   }
 
-  async function saveAssSubtitles() {
+  // `type`: "cover" (opaque intertitle card over each scene — the original behavior) or
+  // "countdown" (a small heads-up text counting down to each scene instead of covering it).
+  async function saveAssSubtitles(type) {
     if (!activeVideo) return;
     const { width, height } = getVideoDimensions();
     // Same list as the Timecodes dialog's text view (REPORT_FLOOR + per-class thresholds +
     // current checkbox exclusions), not the general-sensitivity-gated blur segments.
     const segments = currentFilteredTimecodesSegments();
-    const assContent = VMAssExport.generate(width, height, segments, settings.blurAdvance || 0);
+    const generateFn = type === "countdown" ? VMAssExport.generateCountdown : VMAssExport.generate;
+    const assContent = generateFn(width, height, segments, settings.blurAdvance || 0);
     const suggestedName = baseName(activeVideo.fileName) + ".ass";
 
     if (window.showSaveFilePicker) {
@@ -927,8 +926,9 @@
         VMScanner.REPORT_FLOOR,
         interval
       );
+      // No longer auto-downloaded here — the user now downloads via the Timecodes dialog's
+      // own "Download" button (see downloadTimecodesBtn's handler) whenever they want it.
       const txt = VMScanner.segmentsToTxt(segments, keyName);
-      downloadTxt(txt, baseName(keyName) + "_timecodes.txt");
 
       const record = {
         fileName: keyName,

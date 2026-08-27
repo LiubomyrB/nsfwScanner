@@ -45,8 +45,29 @@
   // classScores map (see nudenet-worker.js's detect()) can carry a score for. Duplicated
   // here rather than shared across the worker/main-thread boundary (this classic-script app
   // has no module system to share a constant through) — keep both lists in sync if either
-  // changes.
-  const CONFIRM_LABELS = ["female-breast-bare", "female-vagina", "male-penis", "anus-bare", "buttocks-bare"];
+  // changes. `i18nKey` is the single source of truth for each class's human-readable name —
+  // app.js's per-class sensitivity sliders and the snapshot grid captions, and this file's
+  // own segmentsToTxt (see classDisplayName), all read the same translations through it
+  // rather than keeping their own separate copies.
+  const CONFIRM_CLASSES = [
+    { key: "female-breast-bare", i18nKey: "settings.classFemaleBreastBare" },
+    { key: "female-vagina", i18nKey: "settings.classFemaleVagina" },
+    { key: "male-penis", i18nKey: "settings.classMalePenis" },
+    { key: "anus-bare", i18nKey: "settings.classAnusBare" },
+    { key: "buttocks-bare", i18nKey: "settings.classButtocksBare" },
+  ];
+  const CONFIRM_LABELS = CONFIRM_CLASSES.map((c) => c.key);
+  const CONFIRM_CLASS_I18N_BY_KEY = {};
+  CONFIRM_CLASSES.forEach((c) => { CONFIRM_CLASS_I18N_BY_KEY[c.key] = c.i18nKey; });
+
+  // The human-readable name for a detected body-part class (e.g. "female-breast-bare" ->
+  // "Female breast") — null if `label` isn't a recognized class (undefined/legacy samples
+  // with no per-class breakdown at all).
+  function classDisplayName(label) {
+    const i18nKey = label && CONFIRM_CLASS_I18N_BY_KEY[label];
+    if (!i18nKey) return null;
+    return (global.VMI18n && global.VMI18n.t(i18nKey)) || label;
+  }
 
   // Resolve the worker scripts relative to *this script's* own location (same reasoning as
   // transcoder.js's vendored-module path) so it keeps working regardless of what directory
@@ -199,11 +220,41 @@
 
   function seekTo(video, time) {
     return new Promise((resolve) => {
+      let settled = false;
+      let fallbackTimer = null;
+
+      function finish() {
+        if (settled) return;
+        settled = true;
+        video.removeEventListener("seeked", onSeeked);
+        if (fallbackTimer) clearTimeout(fallbackTimer);
+        resolve();
+      }
+
       function onSeeked() {
         video.removeEventListener("seeked", onSeeked);
-        // double rAF so the decoded frame is actually painted before we read pixels
-        requestAnimationFrame(() => requestAnimationFrame(resolve));
+        // Confirm the seeked frame has actually been decoded/presented before drawImage
+        // reads it — reading immediately on "seeked" can still return the previous frame
+        // (reproduced directly). requestVideoFrameCallback (when available) is the correct,
+        // purpose-built signal for this; a double rAF is the fallback for browsers without
+        // it (Safari).
+        //
+        // Neither is guaranteed to fire while the tab is in the background — both are tied
+        // to the rendering/compositor pipeline, which gets throttled or paused entirely when
+        // hidden (reproduced directly: scanning a backgrounded tab froze completely, because
+        // this promise never resolved). The timer below is the actual fix: it guarantees
+        // this seek resolves regardless, so a backgrounded scan keeps making progress
+        // — worst case capturing a frame slightly before its paint is confirmed, rather than
+        // hanging forever. In the normal foreground case it's inert: the frame-ready signal
+        // above almost always wins the race well under this timeout.
+        fallbackTimer = setTimeout(finish, 300);
+        if (video.requestVideoFrameCallback) {
+          video.requestVideoFrameCallback(finish);
+        } else {
+          requestAnimationFrame(() => requestAnimationFrame(finish));
+        }
       }
+
       video.addEventListener("seeked", onSeeked);
       try {
         video.currentTime = time;
@@ -859,13 +910,15 @@
     const lines = [];
     lines.push(`# Nudity scan results for: ${fileName}`);
     lines.push(`# Generated: ${new Date().toString()}`);
-    lines.push(`# Format: start - end : probability`);
+    lines.push(`# Format: N. start - end : probability : class`);
     if (!segments.length) {
       lines.push("# No nudity scenes detected.");
     }
-    for (const seg of segments) {
-      lines.push(`${formatTime(seg.start)} - ${formatTime(seg.end)} : ${seg.probability.toFixed(3)}`);
-    }
+    segments.forEach((seg, i) => {
+      const className = classDisplayName(seg.label);
+      const suffix = className ? ` : ${className}` : "";
+      lines.push(`${i + 1}. ${formatTime(seg.start)} - ${formatTime(seg.end)} : ${seg.probability.toFixed(3)}${suffix}`);
+    });
     return lines.join("\n") + "\n";
   }
 
@@ -881,5 +934,7 @@
     getWorkerPool,
     REPORT_FLOOR,
     CONFIRM_LABELS,
+    CONFIRM_CLASSES,
+    classDisplayName,
   };
 })(window);

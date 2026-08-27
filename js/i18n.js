@@ -110,7 +110,11 @@
       },
 
       "assInfoDialog.title": "Save subtitle file",
-      "assInfoDialog.textHtml": 'When you click "Save", pick the <strong>same folder where the video file is located</strong>, and keep the suggested file name. Most media players automatically load a subtitle file with the same name as the video, sitting next to it — once saved there, this subtitle will automatically cover the screen when a detected scene plays, even outside this app.',
+      "assInfoDialog.textHtml": 'When you click "Save" below, pick the <strong>same folder where the video file is located</strong>, and keep the suggested file name. Most media players automatically load a subtitle file with the same name as the video, sitting next to it — once saved there, these subtitles will play automatically alongside the video, even outside this app. Choose which style to save below.',
+      "assInfoDialog.coverTitle": "Full-screen cover",
+      "assInfoDialog.coverHint": 'Shows an opaque intertitle-style card over the whole frame for the duration of each scene (plus "Blur in advance" on both sides) — hides the content completely, like this app\'s own in-player blur.',
+      "assInfoDialog.countdownTitle": "Countdown warning",
+      "assInfoDialog.countdownHint": "Shows a small heads-up text counting down the seconds until each scene starts, instead of covering anything — lets you look away or skip ahead in time rather than hiding the video.",
       "assInfoDialog.save": "Save",
       "assInfoDialog.close": "Close",
 
@@ -156,6 +160,12 @@
       "settings.close": "Close",
 
       "intertitle.text": "Censored scene",
+      "intertitle.countdownText": {
+        one: "Please blur scene in {count} second",
+        few: "Please blur scene in {count} seconds",
+        many: "Please blur scene in {count} seconds",
+        other: "Please blur scene in {count} seconds",
+      },
     },
 
     uk: {
@@ -258,7 +268,11 @@
       },
 
       "assInfoDialog.title": "Зберегти файл субтитрів",
-      "assInfoDialog.textHtml": 'Натиснувши «Зберегти», оберіть <strong>ту саму папку, де знаходиться відеофайл</strong>, і залиште запропоновану назву файлу без змін. Більшість медіаплеєрів автоматично завантажують файл субтитрів з такою самою назвою, як і у відео, що лежить поруч — після збереження туди ці субтитри автоматично закриватимуть екран під час відтворення знайденої сцени, навіть поза цим застосунком.',
+      "assInfoDialog.textHtml": 'Натиснувши «Зберегти» нижче, оберіть <strong>ту саму папку, де знаходиться відеофайл</strong>, і залиште запропоновану назву файлу без змін. Більшість медіаплеєрів автоматично завантажують файл субтитрів з такою самою назвою, як і у відео, що лежить поруч — після збереження туди ці субтитри автоматично відтворюватимуться разом із відео, навіть поза цим застосунком. Оберіть стиль нижче.',
+      "assInfoDialog.coverTitle": "Повноекранне прикриття",
+      "assInfoDialog.coverHint": "Показує непрозору картку у стилі інтертитру на весь кадр протягом усієї сцени (плюс «Розмиття завчасно» з обох боків) — повністю приховує вміст, як і власне розмиття цього застосунку.",
+      "assInfoDialog.countdownTitle": "Попередження зі зворотним відліком",
+      "assInfoDialog.countdownHint": "Показує невеликий текст-попередження зі зворотним відліком секунд до початку сцени, замість того щоб щось приховувати — дає змогу відвести погляд або перемотати заздалегідь, а не приховує відео.",
       "assInfoDialog.save": "Зберегти",
       "assInfoDialog.close": "Закрити",
 
@@ -304,6 +318,12 @@
       "settings.close": "Закрити",
 
       "intertitle.text": "Сцену приховано",
+      "intertitle.countdownText": {
+        one: "Будь ласка, розмийте сцену через {count} секунду",
+        few: "Будь ласка, розмийте сцену через {count} секунди",
+        many: "Будь ласка, розмийте сцену через {count} секунд",
+        other: "Будь ласка, розмийте сцену через {count} секунд",
+      },
     },
   };
 

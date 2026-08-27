@@ -445,6 +445,25 @@ html, body {
   margin: 16px 0;
   font-size: 14px;
 }
+.ass-type-option {
+  margin: 14px 0;
+  padding: 12px 14px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+}
+.ass-type-option-title {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text);
+  margin-bottom: 4px;
+}
+.ass-type-option .hint {
+  margin: 0 0 10px;
+}
+.ass-type-option .btn {
+  width: 100%;
+}
+
 .class-thresholds {
   margin: 12px 0;
   padding: 12px 14px;

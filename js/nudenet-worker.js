@@ -228,6 +228,12 @@ let mediabunnyModulePromise = null;
 let mediabunnyInput = null;
 let mediabunnySink = null;
 let mediabunnyReadyPromise = null;
+// Set by a "prefetchMediabunny" message (see scan-coordinator-worker.js's sampleAtTimes) —
+// a VideoSampleSink.samplesAtTimestamps() iterator over a whole pass's times at once,
+// consumed one .next() per detectAtTimeMediabunny call in the same order they were listed.
+// Falls back to plain getSample(time) below when this hasn't been set (shouldn't normally
+// happen in mediabunny mode, but stay correct rather than throw if it doesn't arrive first).
+let mediabunnySampleIterator = null;
 
 // Mediabunny ships ESM-only; dynamic import() works fine from a classic worker script (same
 // trick mediabunny-player.js uses on the main thread — see its own comment). Named by the
@@ -248,6 +254,7 @@ function loadMediabunny() {
 function initMediabunny(file) {
   frameAcquisitionMode = "mediabunny";
   mediabunnySink = null;
+  mediabunnySampleIterator = null;
   mediabunnyReadyPromise = (async () => {
     if (mediabunnyInput) {
       try { mediabunnyInput.dispose(); } catch (e) { /* ignore */ }
@@ -265,6 +272,17 @@ function initMediabunny(file) {
         });
   })();
   return mediabunnyReadyPromise;
+}
+
+// Replaces the current prefetch iterator with one covering this pass's whole (ascending)
+// time list — see scan-coordinator-worker.js's sampleAtTimes for why this is sent once per
+// pass rather than per frame. Queued behind mediabunnyReadyPromise since the sink might not
+// exist yet (this can arrive before initMediabunny's own async setup finishes); safe to just
+// overwrite mediabunnySampleIterator on every call — by the time a later pass's prefetch
+// arrives, the previous pass's sampleAtTimes loop (and all its .next() calls) has always
+// already finished, since classify requests are strictly sequential.
+function handlePrefetchMediabunny(times) {
+  mediabunnySampleIterator = mediabunnyReadyPromise.then(() => mediabunnySink.samplesAtTimestamps(times));
 }
 
 const FRAME_WAIT_TIMEOUT_MS = 1000;
@@ -346,7 +364,16 @@ async function detectAtTime(time, minScore) {
 async function detectAtTimeMediabunny(time, minScore) {
   let time0 = performance.now();
   await mediabunnyReadyPromise;
-  const sample = await mediabunnySink.getSample(time);
+  let sample;
+  if (mediabunnySampleIterator) {
+    // mediabunnySampleIterator is a Promise<AsyncGenerator> (see handlePrefetchMediabunny) —
+    // await it once to get the actual generator, then pull the next queued sample from it.
+    const iterator = await mediabunnySampleIterator;
+    const outcome = await iterator.next();
+    sample = outcome.done ? null : outcome.value;
+  } else {
+    sample = await mediabunnySink.getSample(time);
+  }
   console.log('detectAtTimeMediabunny getSample', (performance.now() - time0) / 1000, time)
   if (!sample) return null;
   const vw = sample.displayWidth || 1;
@@ -434,6 +461,7 @@ self.onmessage = async (e) => {
     coordinatorPort = msg.port;
     coordinatorPort.onmessage = (ev) => {
       if (ev.data && ev.data.type === "classify") handleCoordinatorClassify(ev.data);
+      else if (ev.data && ev.data.type === "prefetchMediabunny") handlePrefetchMediabunny(ev.data.times);
     };
     return;
   }

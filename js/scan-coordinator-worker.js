@@ -163,6 +163,21 @@
   // worker couldn't find a matching frame for.
   async function sampleAtTimes(times, onSampleDone) {
     const results = [];
+    // mode === "mediabunny": hand the whole (ascending) time list to nudenet-worker up front
+    // via VideoSampleSink.samplesAtTimestamps(times) instead of one independent getSample()
+    // call per classify request — its own docs say this "intelligently pre-decode[s] a few
+    // frames ahead", i.e. decoding for samples further down the list can already be underway
+    // before we actually ask for them. The hope (per the throttling still observed on
+    // getSample() specifically — worth confirming empirically) is that decode work already
+    // queued/in flight via WebCodecs isn't gated the same way freshly-scheduled per-call work
+    // is once the tab backgrounds, so getting the whole list queued as early as possible in
+    // each pass matters more than exactly when in the scan it happens. Sent over the same
+    // ordered port classify requests use, so it's guaranteed to arrive first. Same message
+    // for every pass (coarse, plain fine, and classifyRunsWithDedup's representative picks)
+    // — this is the one place all of them funnel through.
+    if (mode === "mediabunny" && times.length) {
+      nudenetPort.postMessage({ type: "prefetchMediabunny", times });
+    }
     for (const time of times) {
          let time0 = performance.now();
       if (cancelled) break;
@@ -215,7 +230,11 @@
   // fine pass — "confirm" mode's own exact-timing path stays on the old architecture).
   async function classifyRunsWithDedup(runs, forcedTimesPerRun, onProgress) {
     const toClassify = runs.flatMap((run, i) => pickRepresentatives(run, MAX_CONFIRMS_PER_RUN, forcedTimesPerRun && forcedTimesPerRun[i]));
-    const times = toClassify.map((c) => c.time);
+    // Ascending, unlike toClassify's own order (forced-time picks can land out of sequence
+    // within a run) — sampleAtTimes' mediabunny prefetch (see its own comment) needs a
+    // monotonic list to hand to samplesAtTimestamps. Doesn't change results: classified
+    // samples get matched back up by time via classifiedByTime below, not by array position.
+    const times = toClassify.map((c) => c.time).sort((a, b) => a - b);
     let done = 0;
     const classified = await sampleAtTimes(times, () => {
       done++;

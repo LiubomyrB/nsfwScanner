@@ -31,6 +31,7 @@
       "scan.statusCoarsePass": "Scanning (coarse pass)…",
       "scan.statusScanningFrames": "Scanning frames…",
       "scan.statusScanningFramesNudenet": "Scanning frames with body-part detector…",
+      "scan.timingLine": "Elapsed {elapsed} · avg {avgMs} ms/frame",
       "scan.statusRefining": {
         one: "Refining {count} detected region…",
         few: "Refining {count} detected regions…",
@@ -103,11 +104,12 @@
       "timecodesDialog.close": "Close",
       "timecodesDialog.none": "(no timecodes recorded for this scan)",
       "timecodesDialog.scanStats": {
-        one: "Scan finished in {duration} — {count} scene detected.",
-        few: "Scan finished in {duration} — {count} scenes detected.",
-        many: "Scan finished in {duration} — {count} scenes detected.",
-        other: "Scan finished in {duration} — {count} scenes detected.",
+        one: "Scan finished in {duration} — {count} scene detected.{avgFrameSuffix}",
+        few: "Scan finished in {duration} — {count} scenes detected.{avgFrameSuffix}",
+        many: "Scan finished in {duration} — {count} scenes detected.{avgFrameSuffix}",
+        other: "Scan finished in {duration} — {count} scenes detected.{avgFrameSuffix}",
       },
+      "timecodesDialog.scanStatsAvgFrameSuffix": " (avg {avgMs} ms/frame)",
 
       "assInfoDialog.title": "Save subtitle file",
       "assInfoDialog.textHtml": 'When you click "Save" below, pick the <strong>same folder where the video file is located</strong>, and keep the suggested file name. Most media players automatically load a subtitle file with the same name as the video, sitting next to it — once saved there, these subtitles will play automatically alongside the video, even outside this app. Choose which style to save below.',
@@ -189,6 +191,7 @@
       "scan.statusCoarsePass": "Сканування (грубий прохід)…",
       "scan.statusScanningFrames": "Сканування кадрів…",
       "scan.statusScanningFramesNudenet": "Сканування кадрів детектором частин тіла…",
+      "scan.timingLine": "Минуло {elapsed} · в середньому {avgMs} мс/кадр",
       "scan.statusRefining": {
         one: "Уточнення {count} знайденої ділянки…",
         few: "Уточнення {count} знайдених ділянок…",
@@ -261,11 +264,12 @@
       "timecodesDialog.close": "Закрити",
       "timecodesDialog.none": "(для цього сканування таймкодів не записано)",
       "timecodesDialog.scanStats": {
-        one: "Сканування завершено за {duration} — знайдено {count} сцену.",
-        few: "Сканування завершено за {duration} — знайдено {count} сцени.",
-        many: "Сканування завершено за {duration} — знайдено {count} сцен.",
-        other: "Сканування завершено за {duration} — знайдено {count} сцен.",
+        one: "Сканування завершено за {duration} — знайдено {count} сцену.{avgFrameSuffix}",
+        few: "Сканування завершено за {duration} — знайдено {count} сцени.{avgFrameSuffix}",
+        many: "Сканування завершено за {duration} — знайдено {count} сцен.{avgFrameSuffix}",
+        other: "Сканування завершено за {duration} — знайдено {count} сцен.{avgFrameSuffix}",
       },
+      "timecodesDialog.scanStatsAvgFrameSuffix": " (у середньому {avgMs} мс/кадр)",
 
       "assInfoDialog.title": "Зберегти файл субтитрів",
       "assInfoDialog.textHtml": 'Натиснувши «Зберегти» нижче, оберіть <strong>ту саму папку, де знаходиться відеофайл</strong>, і залиште запропоновану назву файлу без змін. Більшість медіаплеєрів автоматично завантажують файл субтитрів з такою самою назвою, як і у відео, що лежить поруч — після збереження туди ці субтитри автоматично відтворюватимуться разом із відео, навіть поза цим застосунком. Оберіть стиль нижче.',

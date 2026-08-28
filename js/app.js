@@ -107,7 +107,7 @@
     [
       "settingsBtn", "openFileBtn", "timecodesBtn", "languageBtn", "languageBtnLabel",
       "startScreen", "pickFileBtn", "resumeBox", "resumeText", "resumeBtn", "resumeDismissBtn",
-      "scanScreen", "scanProgressBar", "scanProgressText", "scanStatusText", "cancelScanBtn",
+      "scanScreen", "scanProgressBar", "scanProgressText", "scanStatusText", "scanTimingText", "cancelScanBtn",
       "transcodeScreen", "transcodeProgressBar", "transcodeProgressText", "transcodeStatusText", "cancelTranscodeBtn",
       "playerScreen", "videoWrap", "video", "mediabunnyCanvas", "blurBadge", "audioTrackSelect", "fileNameLabel",
       "playerControls", "playPauseBtn", "playIcon", "pauseIcon", "currentTimeLabel", "durationLabel",
@@ -552,9 +552,16 @@
     }
     const seconds = lastScanStats.elapsedMs / 1000;
     const duration = formatControlTime(seconds, seconds >= 3600);
+    // scanStats (avg time/frame) only exists for the coordinated NudeNet path (seek/stream/
+    // mediabunny frame-acquisition modes) — other detection modes just don't have a
+    // per-frame timing source, so the suffix stays empty and the sentence reads as before.
+    const avgFrameSuffix = lastScanStats.scanStats && lastScanStats.scanStats.sampleCount
+      ? VMI18n.t("timecodesDialog.scanStatsAvgFrameSuffix", { avgMs: Math.round(lastScanStats.scanStats.avgFrameMs) })
+      : "";
     els.timecodesStats.textContent = VMI18n.t("timecodesDialog.scanStats", {
       count: lastScanStats.sceneCount,
       duration,
+      avgFrameSuffix,
     });
     els.timecodesStats.classList.remove("hidden");
   }
@@ -905,7 +912,7 @@
     const scanStartedAt = Date.now();
     startBackgroundKeepAliveAudio();
     try {
-      const { samples, duration, interval } = await VMScanner.scanVideoFile(file, {
+      const { samples, duration, interval, scanStats } = await VMScanner.scanVideoFile(file, {
         onProgress: updateScanProgress,
         onStatus: (msg) => { els.scanStatusText.textContent = msg; },
         token: cancelToken,
@@ -952,7 +959,7 @@
       await VMDB.put("meta", { id: "app", lastOpenedFileName: keyName });
 
       await finalizeAndLoadPlayer(file, handle, record, 0, true, audioAlreadyOk);
-      openTimecodesDialog({ elapsedMs: Date.now() - scanStartedAt, sceneCount: segments.length });
+      openTimecodesDialog({ elapsedMs: Date.now() - scanStartedAt, sceneCount: segments.length, scanStats });
     } catch (e) {
       if (e && e.cancelled) {
         showStartScreen();
@@ -1077,10 +1084,25 @@
     await loadPlayerWithData(finalFile, finalHandle, record, resumeTime, resumePaused, useMediabunny);
   }
 
-  function updateScanProgress(pct) {
+  // `stats`, when the active scan reports it (the coordinated NudeNet path — seek/stream/
+  // mediabunny frame-acquisition modes all funnel through the same coordinator worker, which
+  // is what actually tracks this — see scan-coordinator-worker.js's timingSnapshot), is
+  // { elapsedMs, avgFrameMs, sampleCount }. Other detection modes/paths just don't pass a
+  // second argument, and the timing line stays hidden — same as before this existed.
+  function updateScanProgress(pct, stats) {
     const p = Math.round(pct);
     els.scanProgressBar.style.width = p + "%";
     els.scanProgressText.textContent = p + "%";
+    if (stats && stats.sampleCount) {
+      const elapsedSeconds = stats.elapsedMs / 1000;
+      els.scanTimingText.textContent = VMI18n.t("scan.timingLine", {
+        elapsed: formatControlTime(elapsedSeconds, elapsedSeconds >= 3600),
+        avgMs: Math.round(stats.avgFrameMs),
+      });
+      els.scanTimingText.classList.remove("hidden");
+    } else {
+      els.scanTimingText.classList.add("hidden");
+    }
   }
 
   // ---------- player ----------
@@ -1663,6 +1685,8 @@
     els.scanProgressBar.style.width = "0%";
     els.scanProgressText.textContent = "0%";
     els.scanStatusText.textContent = VMI18n.t("scan.statusLoadingModel");
+    els.scanTimingText.textContent = "";
+    els.scanTimingText.classList.add("hidden");
   }
 
   function showTranscodeScreen() {

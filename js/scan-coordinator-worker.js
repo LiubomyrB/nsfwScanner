@@ -16,8 +16,19 @@
 (function () {
   let nudenetPort = null;
   let cancelled = false;
+  let mode = "stream";
   let msgId = 0;
   const pending = new Map();
+  let frameMsgId = 0;
+  const pendingFrames = new Map();
+
+  // Scan-wide timing (spans both coarse and fine passes, whichever frame-acquisition mode
+  // is active) — feeds the "average time per frame" / elapsed-timer progress info shown in
+  // the UI alongside the plain percentage. samplesCompleted counts every sampleAtTimes loop
+  // iteration actually attempted (success or not — a timed-out/skipped attempt still cost
+  // real wall-clock time, so it belongs in the average same as a successful one).
+  let scanStartTime = 0;
+  let samplesCompleted = 0;
 
   function clamp(v, lo, hi) {
     return Math.max(lo, Math.min(hi, v));
@@ -96,12 +107,30 @@
   // Requests a classification from nudenet-worker for `time`, over the direct port — no
   // main-thread involvement in this round trip. Resolves to null if nudenet-worker found no
   // matching frame in time (rare — see its own FRAME_WAIT_TIMEOUT_MS) rather than throwing,
-  // so one missed sample doesn't abort the whole scan.
-  function classifyAt(time) {
+  // so one missed sample doesn't abort the whole scan. `bitmap` (mode === "seek" only) is an
+  // already-captured, already-letterboxed frame from the main thread — nudenet-worker
+  // classifies it directly instead of matching one off its stream.
+  function classifyAt(time, bitmap) {
     return new Promise((resolve, reject) => {
       const id = ++msgId;
       pending.set(id, { resolve, reject });
-      nudenetPort.postMessage({ type: "classify", id, time, minScore: 0.2 });
+      if (bitmap) {
+        nudenetPort.postMessage({ type: "classify", id, time, bitmap, minScore: 0.2 }, [bitmap]);
+      } else {
+        nudenetPort.postMessage({ type: "classify", id, time, minScore: 0.2 });
+      }
+    });
+  }
+
+  // mode === "seek" only: asks the main thread (via the "seek" postMessage, see
+  // scanner.js's runCoordinatedNudeNetScan) to seek the <video> and grab a letterboxed
+  // bitmap of the frame it lands on, and waits for the matching "frameReady" reply.
+  // Resolves to null if the main thread couldn't produce one (seek/grab error).
+  function requestFrame(time) {
+    return new Promise((resolve) => {
+      const id = ++frameMsgId;
+      pendingFrames.set(id, resolve);
+      self.postMessage({ type: "seek", time, id });
     });
   }
 
@@ -135,19 +164,37 @@
   async function sampleAtTimes(times, onSampleDone) {
     const results = [];
     for (const time of times) {
+         let time0 = performance.now();
       if (cancelled) break;
-      self.postMessage({ type: "seek", time });
+      samplesCompleted++;
+      let bitmap = null;
+      if (mode === "seek") {
+        let timeR = performance.now();
+        bitmap = await requestFrame(time);
+        console.log('sampleAtTimes bitmap', (performance.now() - timeR) / 1000)
+        if (!bitmap) continue; // main thread couldn't seek/grab this one — skip it
+      } else if (mode === "stream") {
+        self.postMessage({ type: "seek", time });
+      }
+      // mode === "mediabunny": nothing to do here — nudenet-worker pulls the frame itself,
+      // by timestamp, straight off the source File.
       let data;
       try {
-        data = await classifyAt(time);
+        console.log('sampleAtTimes START')
+        let time1 = performance.now();
+        data = await classifyAt(time, bitmap);
+        console.log('sampleAtTimes classifyAt', (performance.now() - time1) / 1000)
       } catch (e) {
         data = null;
       }
       if (data) {
         const sample = Object.assign({ time }, data);
         results.push(sample);
+        let timeS = performance.now();
         if (onSampleDone) onSampleDone(sample);
+        console.log('sampleAtTimes onSampleDone', (performance.now() - timeS) / 1000)
       }
+        console.log('sampleAtTimes FINISH', (performance.now() - time0) / 1000)
     }
     return results;
   }
@@ -214,12 +261,23 @@
     });
 
     if (cancelled) return coarseSamples;
-
+    console.log('scanAdaptive coarseSamples', coarseSamples.length)
     const margin = 0.2;
     const windows = [];
     const triggerTimes = [];
     for (const s of coarseSamples) {
-      if (s.probability >= Math.max(0, sensitivity - margin)) {
+            console.log('scanAdaptive coarseSamples for', s.probability, Math.max(0, sensitivity - margin), sensitivity)
+
+      // s.probability > 0 is required alongside the threshold check, not just the threshold
+      // alone: Math.max(0, sensitivity - margin) clamps to exactly 0 whenever margin >=
+      // sensitivity (e.g. sensitivity 0.09, margin 0.2 -> 0), and probability itself is never
+      // negative (matched ? maxScore : 0) — so probability >= 0 alone is trivially true for
+      // EVERY sample, including ones where nothing was detected at all, forcing a refine
+      // window around literally every coarse sample. Margin exists to catch a real, weak
+      // detection that might be an undersampled near-miss of a higher peak nearby — a flat 0
+      // (no box, no match) isn't a near-miss, it's "found nothing here," and shouldn't be
+      // treated the same as crossing the threshold just because both are >= 0.
+      if (s.probability > 0 && s.probability >= Math.max(0, sensitivity - margin)) {
         windows.push({
           start: Math.max(0, s.time - coarseInterval),
           end: Math.min(duration, s.time + coarseInterval),
@@ -267,8 +325,21 @@
     return combined;
   }
 
+  // Timing snapshot attached to every progress/done message — elapsed wall-clock time since
+  // this scan's "start" message, and the running average per sampleAtTimes attempt so far.
+  // Same shape both places so the UI can show a live version during the scan and the final
+  // version once it's done without special-casing either.
+  function timingSnapshot() {
+    const elapsedMs = performance.now() - scanStartTime;
+    return {
+      elapsedMs,
+      avgFrameMs: samplesCompleted > 0 ? elapsedMs / samplesCompleted : 0,
+      sampleCount: samplesCompleted,
+    };
+  }
+
   function onProgress(pct) {
-    self.postMessage({ type: "progress", pct });
+    self.postMessage(Object.assign({ type: "progress", pct }, timingSnapshot()));
   }
   function onStatus(key, params) {
     self.postMessage({ type: "status", key, params });
@@ -281,12 +352,27 @@
       nudenetPort.onmessage = onNudenetMessage;
       return;
     }
+    if (msg.type === "frameReady") {
+      const resolve = pendingFrames.get(msg.id);
+      if (resolve) {
+        pendingFrames.delete(msg.id);
+        resolve(msg.bitmap || null);
+      }
+      return;
+    }
     if (msg.type === "cancel") {
       cancelled = true;
       return;
     }
     if (msg.type === "start") {
-      const { duration, interval, adaptive, sensitivity, dedupFinePass } = msg;
+      const { duration, interval, adaptive, sensitivity, dedupFinePass, mode: startMode } = msg;
+      // Was `startMode === "seek" ? "seek" : "stream"` — silently collapsed "mediabunny" into
+      // "stream" (wrong: it'd start posting pointless main-thread seek commands and never
+      // take the mediabunny branches in sampleAtTimes). scanner.js only ever sends one of the
+      // three real values, so just trust it.
+      mode = startMode === "seek" || startMode === "mediabunny" ? startMode : "stream";
+      scanStartTime = performance.now();
+      samplesCompleted = 0;
       try {
         let samples;
         if (adaptive) {
@@ -299,7 +385,7 @@
           self.postMessage({ type: "cancelled" });
           return;
         }
-        self.postMessage({ type: "done", samples });
+        self.postMessage(Object.assign({ type: "done", samples }, timingSnapshot()));
       } catch (err) {
         self.postMessage({ type: "error", message: String((err && err.message) || err) });
       }

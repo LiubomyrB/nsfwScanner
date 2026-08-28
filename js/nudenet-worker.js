@@ -126,7 +126,6 @@ console.log('detect 1', (performance.now() - time2) / 1000)
   
   const feeds = {};
   feeds[session.inputNames[0]] = tensor;
-  console.log('detect tensor', ort, (performance.now() - time2) / 1000)
 
   const results = await session.run(feeds);
   console.log('detect E', (performance.now() - timeE) / 1000)
@@ -154,6 +153,7 @@ console.log('detect 1', (performance.now() - time2) / 1000)
     if (maxScore >= minScore) {
       boxes.push([data[i], data[numBoxes + i], data[2 * numBoxes + i], data[3 * numBoxes + i]]);
       scores.push(maxScore);
+
       classIds.push(maxClass);
     }
   }
@@ -184,6 +184,7 @@ console.log('detect 1', (performance.now() - time2) / 1000)
     if (CONFIRM_IDS.includes(classId)) {
       const label = LABELS[classId];
       const box = boxes[i];
+
       parts.push({ score: scores[i], class: label, box });
       if (scores[i] > classScores[label]) {
         classScores[label] = scores[i];
@@ -195,8 +196,12 @@ console.log('detect 1', (performance.now() - time2) / 1000)
       }
     }
   }
-    console.log('detect 3', (performance.now() - time4) / 1000)
-    console.log('detect F', (performance.now() - time0) / 1000)
+    
+  console.log('detect parts 1', parts, scores)
+  console.log('detect parts 2', { matched: parts.length > 0, maxScore: maxConfirmScore, label: maxConfirmLabel, classScores, classBoxes, parts })
+
+console.log('detect 3', (performance.now() - time4) / 1000)
+console.log('detect F', (performance.now() - time0) / 1000)
 
   return { matched: parts.length > 0, maxScore: maxConfirmScore, label: maxConfirmLabel, classScores, classBoxes, parts };
 }
@@ -214,11 +219,61 @@ console.log('detect 1', (performance.now() - time2) / 1000)
 let streamReader = null;
 let coordinatorPort = null;
 
+// mode === "mediabunny" counterpart to the stream/seek state above: instead of a <video>
+// element feeding either a stream or main-thread seeks, this decodes straight from the
+// source File — mediabunny's VideoSampleSink.getSample(time) is genuine random access (the
+// last sample at/before `time`), so there's no main-thread round trip at all in this mode.
+let frameAcquisitionMode = "stream"; // "stream" | "mediabunny" — "seek" mode never touches this file, it always arrives with req.bitmap already set
+let mediabunnyModulePromise = null;
+let mediabunnyInput = null;
+let mediabunnySink = null;
+let mediabunnyReadyPromise = null;
+
+// Mediabunny ships ESM-only; dynamic import() works fine from a classic worker script (same
+// trick mediabunny-player.js uses on the main thread — see its own comment). Named by the
+// full CDN URL rather than the bare "mediabunny" specifier the page's <script type=
+// "importmap"> resolves: import maps are document-scoped and don't reach into Workers, and
+// the bundle itself has no further imports to resolve (verified: no bare `from "..."`
+// specifiers in the bundle), so this doesn't need one either.
+function loadMediabunny() {
+  if (!mediabunnyModulePromise) {
+    mediabunnyModulePromise = import("https://cdn.jsdelivr.net/npm/mediabunny@1.55.2/dist/bundles/mediabunny.min.mjs");
+  }
+  return mediabunnyModulePromise;
+}
+
+// A reused worker (see scanner.js's getCoordinatedNudenetWorker) gets a fresh File every
+// scan — dispose whatever the previous scan's Input was still holding first, same reasoning
+// as initStream cancelling the previous streamReader.
+function initMediabunny(file) {
+  frameAcquisitionMode = "mediabunny";
+  mediabunnySink = null;
+  mediabunnyReadyPromise = (async () => {
+    if (mediabunnyInput) {
+      try { mediabunnyInput.dispose(); } catch (e) { /* ignore */ }
+      mediabunnyInput = null;
+    }
+    const mb = await loadMediabunny();
+    mediabunnyInput = new mb.Input({ source: new mb.BlobSource(file), formats: mb.ALL_FORMATS });
+    const videoTrack = await mediabunnyInput.getPrimaryVideoTrack();
+    if (!videoTrack || !(await videoTrack.canDecode())) {
+      throw new Error("mediabunny cannot decode this file's video track.");
+    }
+    mediabunnySink = new mb.VideoSampleSink(videoTrack, {
+            hardwareAcceleration: 'prefer-hardware',
+            optimizeForLatency: true,
+        });
+  })();
+  return mediabunnyReadyPromise;
+}
+
 const FRAME_WAIT_TIMEOUT_MS = 1000;
 
 // Drains the stream until a frame at/after `time` arrives, discarding stale (pre-seek)
 // frames along the way. Returns null if nothing matches within the deadline.
 async function getFrameAt(time) {
+  let drainStart = performance.now();
+  let discarded = 0;
   const deadline = Date.now() + FRAME_WAIT_TIMEOUT_MS;
   while (Date.now() < deadline) {
     const remaining = deadline - Date.now();
@@ -231,9 +286,14 @@ async function getFrameAt(time) {
     if (done || !value) break;
 
     const frameTime = value.timestamp / 1e6;
-    if (frameTime >= time) return value;
+    if (frameTime >= time) {
+      console.log('getFrameAt drained', discarded, 'frames in', (performance.now() - drainStart) / 1000, 's for time', time)
+      return value;
+    }
+    discarded++;
     value.close();
   }
+  console.log('getFrameAt drained', discarded, 'frames in', (performance.now() - drainStart) / 1000, 's for time', time, '(no match / timed out)')
   return null;
 }
 
@@ -279,14 +339,64 @@ async function detectAtTime(time, minScore) {
   return result;
 }
 
+// mode === "mediabunny" counterpart to detectAtTime: pulls the frame straight out of the
+// source File via VideoSampleSink.getSample(time) instead of matching one off a
+// MediaStreamTrackProcessor stream — same letterbox treatment, just reading a VideoSample
+// (mediabunny's near-zero-cost VideoFrame wrapper) instead of a raw VideoFrame.
+async function detectAtTimeMediabunny(time, minScore) {
+  let time0 = performance.now();
+  await mediabunnyReadyPromise;
+  const sample = await mediabunnySink.getSample(time);
+  console.log('detectAtTimeMediabunny getSample', (performance.now() - time0) / 1000, time)
+  if (!sample) return null;
+  const vw = sample.displayWidth || 1;
+  const vh = sample.displayHeight || 1;
+  const { newW, newH, padLeft, padTop } = letterboxGeometry(vw, vh, INPUT_SIZE);
+  const canvas = new OffscreenCanvas(INPUT_SIZE, INPUT_SIZE);
+  const ctx = canvas.getContext("2d");
+  ctx.fillStyle = "black";
+  ctx.fillRect(0, 0, INPUT_SIZE, INPUT_SIZE);
+  sample.draw(ctx, padLeft, padTop, newW, newH);
+  sample.close();
+  let time1 = performance.now();
+  const bitmap = await createImageBitmap(canvas);
+    console.log('detectAtTimeMediabunny createImageBitmap', (performance.now() - time1) / 1000)
+
+  let time2 = performance.now();
+  const session = await getSession();
+  const result = await detect(session, bitmap, minScore);
+  bitmap.close();
+    console.log('detectAtTimeMediabunny detect', (performance.now() - time2) / 1000)
+    console.log('detectAtTimeMediabunny F', (performance.now() - time0) / 1000)
+  return result;
+}
+
+// mode === "seek" counterpart to detectAtTime: `bitmap` was already captured and
+// letterboxed on the main thread (native video.currentTime seek + canvas grab — see
+// scanner.js's NUDENET_COORDINATED_FRAME_MODE), so there's no stream to drain here at all.
+async function detectBitmap(bitmap, minScore) {
+  const session = await getSession();
+  const result = await detect(session, bitmap, minScore);
+  bitmap.close();
+  return result;
+}
+
 // Requests arrive one at a time in practice (the coordinator awaits each full round trip
 // before sending the next — seeking has to stay strictly sequential, since the stream can
 // only ever reflect one <video>.currentTime at a time), but queue defensively rather than
 // assume that: overlapping reader.read() calls on the same stream would corrupt matching.
 let classifyChain = Promise.resolve();
 function handleCoordinatorClassify(req) {
+  const minScore = typeof req.minScore === "number" ? req.minScore : 0.2;
+  console.log('handleCoordinatorClassify minScore', minScore, req.time)
   classifyChain = classifyChain
-    .then(() => detectAtTime(req.time, typeof req.minScore === "number" ? req.minScore : 0.2))
+    .then(() => {
+      if (req.bitmap) return detectBitmap(req.bitmap, minScore);
+      let time1 = performance.now();
+      if (frameAcquisitionMode === "mediabunny") return detectAtTimeMediabunny(req.time, minScore);
+      console.log('handleCoordinatorClassify 1', (performance.now() - time1) / 1000)
+      return detectAtTime(req.time, minScore);
+    })
     .then((result) => {
       if (!result) {
         coordinatorPort.postMessage({ id: req.id, ok: true, empty: true });
@@ -305,10 +415,19 @@ self.onmessage = async (e) => {
   if (msg && msg.type === "initStream") {
     // A reused worker (see scanner.js's getCoordinatedNudenetWorker) gets a fresh stream
     // every scan — release whatever the previous scan's reader was still holding first.
+    frameAcquisitionMode = "stream";
     if (streamReader) {
       try { streamReader.cancel(); } catch (e) { /* ignore */ }
     }
     streamReader = msg.readable.getReader();
+    return;
+  }
+  if (msg && msg.type === "initMediabunny") {
+    initMediabunny(msg.file).catch((err) => {
+      // Surfaced to the coordinator on the next classify request instead of here — there's
+      // no request id to reply to yet at init time. Logging keeps it from failing silently.
+      console.error("initMediabunny failed", err);
+    });
     return;
   }
   if (msg && msg.type === "initCoordinatorPort") {

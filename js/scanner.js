@@ -231,14 +231,16 @@
       let settled = false;
       let fallbackTimer = null;
 
+ let time1 = performance.now()
       function finish() {
         if (settled) return;
         settled = true;
         video.removeEventListener("seeked", onSeeked);
+        console.log('set currentTime', time, (performance.now() - time1) / 1000)
+        console.trace();
         if (fallbackTimer) clearTimeout(fallbackTimer);
         resolve();
       }
-
       function onSeeked() {
         video.removeEventListener("seeked", onSeeked);
         // Confirm the seeked frame has actually been decoded/presented before drawImage
@@ -253,6 +255,7 @@
         // path degrades gracefully rather than hanging outright — but see createFrameSource
         // below for the actually-reliable fix used when the browser supports it.
         fallbackTimer = setTimeout(finish, 300);
+
         if (video.requestVideoFrameCallback) {
           video.requestVideoFrameCallback(finish);
         } else {
@@ -262,6 +265,7 @@
 
       video.addEventListener("seeked", onSeeked);
       try {
+       
         video.currentTime = time;
       } catch (e) {
         video.removeEventListener("seeked", onSeeked);
@@ -586,7 +590,16 @@
     const windows = [];
     const triggerTimes = [];
     for (const s of coarseSamples) {
-      if (s.probability >= Math.max(0, sensitivity - margin)) {
+      // s.probability > 0 is required alongside the threshold check, not just the threshold
+      // alone: Math.max(0, sensitivity - margin) clamps to exactly 0 whenever margin >=
+      // sensitivity (e.g. sensitivity 0.09, margin 0.2 -> 0), and probability itself is never
+      // negative (matched ? maxScore : 0) — so probability >= 0 alone is trivially true for
+      // EVERY sample, including ones where nothing was detected at all, forcing a refine
+      // window around literally every coarse sample. Margin exists to catch a real, weak
+      // detection that might be an undersampled near-miss of a higher peak nearby — a flat 0
+      // (no box, no match) isn't a near-miss, it's "found nothing here," and shouldn't be
+      // treated the same as crossing the threshold just because both are >= 0.
+      if (s.probability > 0 && s.probability >= Math.max(0, sensitivity - margin)) {
         windows.push({
           start: Math.max(0, s.time - coarseInterval),
           end: Math.min(duration, s.time + coarseInterval),
@@ -842,27 +855,66 @@
     return coordinatedNudenetReady.then(() => coordinatedNudenetWorker);
   }
 
+  // Frame acquisition strategy for the coordinator-worker NudeNet scan path — see
+  // runCoordinatedNudeNetScan below. "stream" reads decoded VideoFrames straight off
+  // video.captureStream() + MediaStreamTrackProcessor inside nudenet-worker.js, immune to
+  // rAF/requestVideoFrameCallback-style background throttling — but measured NOT to be
+  // random access: seeking `video.currentTime` doesn't jump the stream, it has to decode
+  // through (and getFrameAt has to discard) every intermediate frame between old and new
+  // position, at roughly real-time decode rate (confirmed: draining ~30 frames / ~0.48s to
+  // cover a 0.5s seek). That makes adaptive scanning's coarse pass (5x larger seeks) pay
+  // proportionally more decode time per sample, wiping out its whole point. "seek" instead
+  // uses the original video.currentTime + "seeked" event + canvas grab (seekTo(), above) —
+  // true fast seeking (browsers jump near a keyframe and decode forward only a little, not
+  // from wherever <video> last was) — relayed through the coordinator worker so the scan
+  // loop itself still isn't main-thread-throttled; only the actual seek+grab runs here.
+  // "mediabunny" skips the <video> element entirely: nudenet-worker opens the source File
+  // directly (mediabunny's Input + BlobSource, demuxing off the main thread) and pulls
+  // frames by timestamp via a VideoSampleSink, whose getSample(time) is documented random
+  // access (last sample at/before the requested time) rather than a decode-through-everything
+  // stream read — so unlike "stream" mode, no main-thread seek round trip is needed at all,
+  // and unlike "seek" mode, nothing depends on the "seeked" event/rVFC firing. Change this to
+  // compare all three.
+  const NUDENET_COORDINATED_FRAME_MODE = "mediabunny"; // "seek" | "stream" | "mediabunny"
+
   // Runs a NudeNet-primary scan (adaptive or uniform) via scan-coordinator-worker.js talking
   // directly to the (reused) nudenet worker over a private MessagePort — see that file's own
   // comment for why this exists instead of the frameSource-based path below: neither the
   // scan loop's pacing (lives entirely in the coordinator worker) nor frame acquisition
-  // (lives entirely in the nudenet worker) depend on anything the main thread does, so a
+  // (lives entirely in the nudenet worker, in "stream" mode — see NUDENET_COORDINATED_FRAME_MODE
+  // above for "seek" mode's tradeoff) depend on anything the main thread does, so a
   // backgrounded tab can't deprioritize either. The main thread's only remaining role is
   // applying seek commands (only it has the <video> element) and relaying progress/status to
   // the DOM. Only used when SUPPORTS_STREAM_CAPTURE — see scanVideoFile.
   async function runCoordinatedNudeNetScan(video, opts) {
-    const { duration, interval, adaptive, sensitivity, dedupFinePass, onProgress, onStatus, token } = opts;
+    const { duration, interval, adaptive, sensitivity, dedupFinePass, onProgress, onStatus, token, file } = opts;
+    const mode = NUDENET_COORDINATED_FRAME_MODE;
 
     const nudenetWorker = await getCoordinatedNudenetWorker(onStatus);
 
-    const stream = video.captureStream();
-    const track = stream.getVideoTracks()[0];
-    const processor = new MediaStreamTrackProcessor({ track });
-    const readable = processor.readable;
+    let track = null;
+    let nudenetCanvas = null;
+    let nudenetCtx = null;
+    if (mode === "stream") {
+      const stream = video.captureStream();
+      track = stream.getVideoTracks()[0];
+      const processor = new MediaStreamTrackProcessor({ track });
+      const readable = processor.readable;
+      nudenetWorker.postMessage({ type: "initStream", readable }, [readable]);
+    } else if (mode === "seek") {
+      nudenetCanvas = document.createElement("canvas");
+      nudenetCanvas.width = NUDENET_INPUT_SIZE;
+      nudenetCanvas.height = NUDENET_INPUT_SIZE;
+      nudenetCtx = nudenetCanvas.getContext("2d");
+    } else {
+      // "mediabunny" — no <video>/canvas involvement at all; the worker decodes straight
+      // from the source File. A File is structured-cloneable (postMessage copies only a
+      // lightweight handle, not the bytes), so no transfer list is needed here.
+      nudenetWorker.postMessage({ type: "initMediabunny", file });
+    }
 
     const coordinator = new Worker(SCAN_COORDINATOR_WORKER_URL);
     const channel = new MessageChannel();
-    nudenetWorker.postMessage({ type: "initStream", readable }, [readable]);
     nudenetWorker.postMessage({ type: "initCoordinatorPort", port: channel.port1 }, [channel.port1]);
     coordinator.postMessage({ type: "nudenetPort", port: channel.port2 }, [channel.port2]);
 
@@ -871,7 +923,7 @@
       function cleanup() {
         if (token) token.onCancel = null;
         try { coordinator.terminate(); } catch (e) { /* ignore */ }
-        try { track.stop(); } catch (e) { /* ignore */ }
+        if (track) { try { track.stop(); } catch (e) { /* ignore */ } }
       }
       function finish(fn) {
         if (settled) return;
@@ -887,13 +939,36 @@
       coordinator.onmessage = (e) => {
         const msg = e.data;
         if (msg.type === "seek") {
-          try { video.currentTime = msg.time; } catch (err) { /* ignore */ }
+          if (mode === "seek") {
+            (async () => {
+              try {
+                let time1 = performance.now();
+                await seekTo(video, msg.time);
+                console.log('seekTo', (performance.now() - time1) / 1000);
+                let time2 = performance.now();
+                const bitmap = await grabLetterboxBitmap(video, nudenetCanvas, nudenetCtx, NUDENET_INPUT_SIZE);
+                console.log('seekTo 2', (performance.now() - time1) / 1000);
+                coordinator.postMessage({ type: "frameReady", id: msg.id, bitmap }, [bitmap]);
+              } catch (err) {
+                coordinator.postMessage({ type: "frameReady", id: msg.id, bitmap: null });
+              }
+            })();
+          } else {
+            try { 
+                let time1 = performance.now()
+                video.currentTime = msg.time;
+                console.log('set currentTime', (performance.now() - time1) / 1000)
+            } catch (err) { /* ignore */ }
+          }
         } else if (msg.type === "progress") {
-          if (onProgress) onProgress(msg.pct);
+          if (onProgress) onProgress(msg.pct, { elapsedMs: msg.elapsedMs, avgFrameMs: msg.avgFrameMs, sampleCount: msg.sampleCount });
         } else if (msg.type === "status") {
           if (onStatus) onStatus(VMI18n.t(msg.key, msg.params));
         } else if (msg.type === "done") {
-          finish(() => resolve(msg.samples));
+          finish(() => resolve({
+            samples: msg.samples,
+            scanStats: { elapsedMs: msg.elapsedMs, avgFrameMs: msg.avgFrameMs, sampleCount: msg.sampleCount },
+          }));
         } else if (msg.type === "cancelled") {
           finish(() => {
             const err = new Error("cancelled");
@@ -910,7 +985,7 @@
         if (token.cancelled) token.onCancel();
       }
 
-      coordinator.postMessage({ type: "start", duration, interval, adaptive, sensitivity, dedupFinePass });
+      coordinator.postMessage({ type: "start", duration, interval, adaptive, sensitivity, dedupFinePass, mode });
     });
   }
 
@@ -1007,16 +1082,19 @@
         : onProgress;
 
       let samples;
+      let scanStats = null;
       if (usesNudeNetPrimary) {
         if (useCoordinatedNudeNet) {
           // See runCoordinatedNudeNetScan's own comment for why this exists — the scan
           // loop's pacing and frame acquisition both run off the main thread entirely, so
           // neither can be deprioritized by a backgrounded tab. No frameSource/canvas setup
           // needed here at all; that's all internal to the coordinator + nudenet worker.
-          samples = await runCoordinatedNudeNetScan(video, {
+          const coordinated = await runCoordinatedNudeNetScan(video, {
             duration, interval, adaptive, sensitivity, dedupFinePass: !exactTiming,
-            onProgress: primaryProgress, onStatus, token,
+            onProgress: primaryProgress, onStatus, token, file,
           });
+          samples = coordinated.samples;
+          scanStats = coordinated.scanStats;
         } else if (adaptive) {
           // Fallback (no MediaStreamTrackProcessor support, e.g. Firefox/Safari) — the
           // frameSource-based path; see createFrameSource's own comment.
@@ -1057,7 +1135,7 @@
       }
       if (onProgress) onProgress(100);
 
-      return { samples, duration, interval };
+      return { samples, duration, interval, scanStats };
     } finally {
       if (frameSource) frameSource.destroy();
       video.pause();

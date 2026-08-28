@@ -146,6 +146,10 @@
       <p class="hint" data-i18n="timecodesDialog.classThresholdsHint">Adjust which body parts count as detected — the list below updates live, and these values are also used when exporting timecodes/subtitles.</p>
     </div>
     <p class="hint" data-i18n="timecodesDialog.snapshotGridHint">Click a thumbnail to unblur it. Uncheck a scene to exclude it from blur during playback and from subtitle export.</p>
+    <label id="moderationFilterField" class="field checkbox-field hidden">
+      <input type="checkbox" id="moderationFilterInput">
+      <span data-i18n="timecodesDialog.moderationFilterLabel">Show only results confirmed by OpenAI moderation</span>
+    </label>
     <div id="timecodesSnapshotGrid" class="snapshot-grid"></div>
     <pre id="timecodesContent" class="timecodes-content"></pre>
     <div class="dialog-actions">
@@ -288,6 +292,19 @@
       <span data-i18n="settings.rememberState">Remember state after reload</span>
     </label>
 
+    <div class="class-thresholds">
+      <div class="class-thresholds-heading" data-i18n="settings.openaiModerationHeading">AI confirmation (optional)</div>
+      <label class="field checkbox-field">
+        <input type="checkbox" id="openaiModerationInput">
+        <span data-i18n="settings.openaiModerationEnabled">Confirm detected scenes with OpenAI Moderation API</span>
+      </label>
+      <label class="field">
+        <span data-i18n="settings.openaiApiKeyLabel">OpenAI API key</span>
+        <input type="password" id="openaiApiKeyInput" autocomplete="off" spellcheck="false" data-i18n-placeholder="settings.openaiApiKeyPlaceholder">
+      </label>
+      <p class="hint" data-i18n-html="settings.openaiApiKeyHintHtml">...</p>
+    </div>
+
     <div class="dialog-actions">
       <button id="closeSettingsBtn" class="btn primary" data-i18n="settings.close">Close</button>
     </div>
@@ -306,6 +323,7 @@
 <script src="js/mediabunny-player.js"></script>
 <script src="js/ass-export.js"></script>
 <script src="js/snapshots.js"></script>
+<script src="js/openai-moderation.js"></script>
 <script src="js/app.js"></script>
 </body>
 </html>

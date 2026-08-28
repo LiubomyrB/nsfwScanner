@@ -34,7 +34,7 @@
     classThresholds: defaultClassThresholds(),
     blurAdvance: 1.5,
     rememberState: true,
-    scanInterval: 0.05,
+    scanInterval: 0.1,
     adaptiveScan: true,
     // "nsfwjs": NSFWJS only. "confirm": NSFWJS scans, NudeNet double-checks what it flags.
     // "nudenet": NudeNet is the primary/only classifier for every sampled frame.
@@ -47,6 +47,14 @@
     // exact scene-boundary timing at the cost of more NudeNet calls. Off by default since
     // it's slower; irrelevant to plain "nsfwjs" mode.
     nudenetExactTiming: false,
+    // Optional secondary confirmation pass, run client-side after a local scan finishes (see
+    // runOpenAIModerationPass) — re-checks each detected scene's peak frame against OpenAI's
+    // real Moderation API. Goes through api/openai-moderation.php, a transparent same-origin
+    // relay (see js/openai-moderation.js's own comment for why — OpenAI's API sends no CORS
+    // headers, so a browser can't call it directly at all) that forwards the key straight
+    // through without storing it. Off unless both fields are set.
+    openaiModerationEnabled: false,
+    openaiApiKey: "",
   };
 
   /** @type {Record<string, any>} */
@@ -117,6 +125,7 @@
       "fileInput",
       "existingDialogOverlay", "existingDialogText", "useExistingBtn", "rescanBtn",
       "timecodesDialogOverlay", "timecodesStats", "classThresholdsTimecodes", "timecodesSnapshotGrid", "timecodesContent",
+      "moderationFilterField", "moderationFilterInput",
       "downloadTimecodesBtn", "downloadSubtitlesBtn", "closeTimecodesBtn",
       "assInfoDialogOverlay", "assInfoCloseX", "assInfoSaveCoverBtn", "assInfoSaveCountdownBtn",
       "transcodeWarningOverlay", "transcodeWarningTitle", "transcodeReasonText", "transcodeFileName",
@@ -124,6 +133,7 @@
       "settingsDialogOverlay", "sensitivityInput", "sensitivityValue", "classThresholdsSettings", "blurAdvanceInput",
       "scanIntervalInput", "scanIntervalComputedHint", "adaptiveScanInput", "rememberStateInput", "closeSettingsBtn",
       "modeNsfwjsInput", "modeConfirmInput", "modeNudenetInput", "nudenetExactTimingInput",
+      "openaiModerationInput", "openaiApiKeyInput",
     ].forEach((id) => { els[id] = document.getElementById(id); });
     els.detectionModeInputs = [els.modeNsfwjsInput, els.modeConfirmInput, els.modeNudenetInput];
   }
@@ -155,6 +165,11 @@
     els.timecodesDialogOverlay.addEventListener("click", (e) => {
       if (e.target === els.timecodesDialogOverlay) closeTimecodesDialog();
     });
+    els.moderationFilterInput.addEventListener("change", () => {
+      renderTimecodesTextList();
+      scheduleSnapshotGridRender(true);
+    });
+
     els.downloadTimecodesBtn.addEventListener("click", () => {
       if (!activeVideo) return;
       const segments = currentFilteredTimecodesSegments();
@@ -208,6 +223,8 @@
     els.detectionModeInputs.forEach((input) => input.addEventListener("change", onDetectionModeChange));
     els.nudenetExactTimingInput.addEventListener("change", onNudenetExactTimingChange);
     els.rememberStateInput.addEventListener("change", onRememberStateChange);
+    els.openaiModerationInput.addEventListener("change", onOpenaiModerationChange);
+    els.openaiApiKeyInput.addEventListener("change", onOpenaiApiKeyChange);
 
     els.useExistingBtn.addEventListener("click", async () => {
       const cb = pendingExisting && pendingExisting.onUseExisting;
@@ -284,6 +301,9 @@
     els.detectionModeInputs.forEach((input) => { input.checked = input.value === settings.detectionMode; });
     els.nudenetExactTimingInput.checked = !!settings.nudenetExactTiming;
     els.rememberStateInput.checked = !!settings.rememberState;
+    els.openaiModerationInput.checked = !!settings.openaiModerationEnabled;
+    els.openaiApiKeyInput.value = settings.openaiApiKey || "";
+    els.openaiApiKeyInput.disabled = !settings.openaiModerationEnabled;
     updateScanIntervalComputedHint();
     syncClassThresholdInputs();
   }
@@ -389,6 +409,11 @@
     lastScanStats = stats || null;
     renderTimecodesDialogStats();
     syncClassThresholdInputs();
+    // Only shown at all when this video's scan actually ran the OpenAI Moderation pass —
+    // defaults to checked each time the dialog opens (not persisted itself; only the
+    // underlying verdicts are — see loadPlayerWithData/startScan).
+    els.moderationFilterField.classList.toggle("hidden", !activeVideo.moderationUsed);
+    els.moderationFilterInput.checked = activeVideo.moderationUsed;
     renderTimecodesDialogContent();
     scheduleSnapshotGridRender(true);
     els.timecodesDialogOverlay.classList.remove("hidden");
@@ -409,6 +434,21 @@
     renderTimecodesTextList();
   }
 
+  // Drops any segment OpenAI Moderation didn't confirm, when the dialog's own filter
+  // checkbox is on — display-only (see its own hint text: "we show...") and gated behind
+  // both activeVideo.moderationUsed (the checkbox is hidden otherwise, but this function can
+  // be called before that's checked) and the checkbox's own state. Deliberately NOT applied
+  // by currentFilteredTimecodesSegments (download/ASS export) — those should keep exporting
+  // everything the local scan found regardless of what this review-time toggle is set to,
+  // same principle as REPORT_FLOOR/excludeUncheckedSnapshots' own scoping.
+  function filterByModeration(segments) {
+    if (!activeVideo || !activeVideo.moderationUsed || !els.moderationFilterInput.checked) return segments;
+    return segments.filter((seg) => {
+      const peak = typeof seg.peakTime === "number" ? seg.peakTime : seg.start;
+      return activeVideo.moderationVerdicts.get(roundTime(peak)) === "confirmed";
+    });
+  }
+
   // Renders the plain-text list from activeVideo.liveTimecodesSegments, filtered by the
   // current checkbox state — so what's shown here always matches exactly what
   // "Download"/"Download as subtitles" will export. Separate from
@@ -417,7 +457,7 @@
   // threshold merge or touching the snapshot grid/thumbnails.
   function renderTimecodesTextList() {
     if (!activeVideo) return;
-    const segments = excludeUncheckedSnapshots(activeVideo.liveTimecodesSegments || []);
+    const segments = filterByModeration(excludeUncheckedSnapshots(activeVideo.liveTimecodesSegments || []));
     const txt = segments.length ? VMScanner.segmentsToTxt(segments, activeVideo.fileName) : "";
     els.timecodesContent.textContent = txt || VMI18n.t("timecodesDialog.none");
   }
@@ -445,7 +485,7 @@
   async function renderTimecodesSnapshotGrid() {
     if (!activeVideo) return;
     const myToken = ++snapshotRenderToken;
-    const segments = activeVideo.liveTimecodesSegments || [];
+    const segments = filterByModeration(activeVideo.liveTimecodesSegments || []);
     buildSnapshotGridSkeleton(segments);
     if (!segments.length) return;
     const { width: vw, height: vh } = getVideoDimensions();
@@ -655,6 +695,17 @@
 
   function onRememberStateChange(e) {
     settings.rememberState = !!e.target.checked;
+    persistSettings();
+  }
+
+  function onOpenaiModerationChange(e) {
+    settings.openaiModerationEnabled = !!e.target.checked;
+    els.openaiApiKeyInput.disabled = !settings.openaiModerationEnabled;
+    persistSettings();
+  }
+
+  function onOpenaiApiKeyChange(e) {
+    settings.openaiApiKey = e.target.value.trim();
     persistSettings();
   }
 
@@ -905,6 +956,41 @@
 
   // ---------- scanning ----------
 
+  // After a local scan finds `segments`, optionally re-checks each one's peak frame (the
+  // moment mergeSegments recorded as having triggered the detection — same frame the
+  // snapshot grid thumbnails) against OpenAI's real Moderation API, as a secondary opinion
+  // gated by settings.openaiModerationEnabled + settings.openaiApiKey (see js/openai-
+  // moderation.js). Runs strictly sequentially — one capture-then-check per scene, not
+  // pooled/concurrent — both to keep this simple and to stay well clear of whatever rate
+  // limit the user's own key is subject to; a scan with many detected scenes will take a
+  // while here, hence the "Confirming N/M with OpenAI…" status text. Returns a
+  // Map<roundedPeakTime, "confirmed"|"rejected"> — a scene whose capture or API call failed
+  // just has no entry (its verdict stays unset) rather than aborting the whole pass, since
+  // the local scan itself already succeeded and shouldn't be undone by this optional
+  // secondary check failing on one frame.
+  async function runOpenAIModerationPass(file, segments, token) {
+    const verdicts = new Map();
+    if (!segments.length) return verdicts;
+
+    const items = segments.map((seg) => ({ time: typeof seg.peakTime === "number" ? seg.peakTime : seg.start }));
+    els.scanStatusText.textContent = VMI18n.t("scan.statusModerationCapturing");
+    const dataUrls = await VMSnapshots.captureFullFrameBatch(file, items);
+
+    for (let i = 0; i < segments.length; i++) {
+      if (token && token.cancelled) break;
+      const dataUrl = dataUrls[i];
+      if (!dataUrl) continue;
+      els.scanStatusText.textContent = VMI18n.t("scan.statusModerationChecking", { current: i + 1, count: segments.length });
+      try {
+        const result = await VMOpenAIModeration.checkImage(settings.openaiApiKey, dataUrl);
+        verdicts.set(roundTime(items[i].time), result.flagged ? "confirmed" : "rejected");
+      } catch (err) {
+        console.warn("OpenAI Moderation check failed for one scene.", err);
+      }
+    }
+    return verdicts;
+  }
+
   async function startScan(file, handle, originalName, audioAlreadyOk) {
     const keyName = originalName || file.name;
     showScanScreen();
@@ -938,6 +1024,20 @@
       // own "Download" button (see downloadTimecodesBtn's handler) whenever they want it.
       const txt = VMScanner.segmentsToTxt(segments, keyName);
 
+      const moderationUsed = !!(settings.openaiModerationEnabled && settings.openaiApiKey);
+      let moderationVerdicts = new Map();
+      if (moderationUsed && !(cancelToken && cancelToken.cancelled)) {
+        // Isolated from the outer try/catch on purpose: this is a secondary, optional check
+        // on top of an already-successful local scan — a failure here (bad key, network
+        // error, whatever) shouldn't discard the real scan results or show a "scan failed"
+        // error for a scan that, in fact, succeeded.
+        try {
+          moderationVerdicts = await runOpenAIModerationPass(file, segments, cancelToken);
+        } catch (err) {
+          console.warn("OpenAI Moderation pass failed; continuing without it.", err);
+        }
+      }
+
       const record = {
         fileName: keyName,
         fileSize: file.size,
@@ -951,6 +1051,14 @@
         lastPaused: true,
         scannedAt: Date.now(),
         updatedAt: Date.now(),
+        moderationUsed,
+        // Array of [roundedPeakTime, verdict] pairs, NOT Object.fromEntries(...) — a plain
+        // object's keys are always coerced to strings, which would silently turn the numeric
+        // roundTime() keys used everywhere else (excludedSnapshotTimes, filterByModeration's
+        // lookup) into strings, breaking every lookup via strict-equality Map.get(). An array
+        // of pairs round-trips through IndexedDB's structured clone with types intact, so
+        // `new Map(record.moderationVerdicts)` below reconstructs the original numeric keys.
+        moderationVerdicts: Array.from(moderationVerdicts.entries()),
       };
       if (handle) record.fileHandle = handle;
       if (file.name !== keyName) record.transcoded = true;
@@ -1124,6 +1232,22 @@
       // peakTime values (rounded via roundTime) the user unchecked in the snapshot grid —
       // restored from the stored record so a reload/resume keeps the same scenes excluded.
       excludedSnapshotTimes: new Set(record.excludedSnapshotTimes || []),
+      // OpenAI Moderation API verdicts from this video's scan (see runOpenAIModerationPass),
+      // keyed the same way as excludedSnapshotTimes above (roundTime of a segment's
+      // peakTime) since segments have no other stable identity across re-merges. Values are
+      // "confirmed" (API agreed it's nudity) or "rejected" (API says it isn't).
+      // moderationUsed records whether the scan that produced this record actually ran the
+      // pass at all — the Timecodes dialog's filter checkbox only appears when it did.
+      // record.moderationVerdicts is normally an array of [time, verdict] pairs (see
+      // startScan) — the Object.entries branch is only for records saved by an earlier,
+      // buggy version of this feature that stored a plain object instead (whose numeric-
+      // looking keys IndexedDB had already coerced to strings); Number(k) recovers those.
+      moderationVerdicts: new Map(
+        Array.isArray(record.moderationVerdicts)
+          ? record.moderationVerdicts
+          : Object.entries(record.moderationVerdicts || {}).map(([k, v]) => [Number(k), v])
+      ),
+      moderationUsed: !!record.moderationUsed,
     };
     recomputeActiveSegments();
     updatePlayerControls(resumeTime || 0);

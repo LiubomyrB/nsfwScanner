@@ -144,5 +144,77 @@
     }
   }
 
-  global.VMSnapshots = { captureBatch };
+  // px, longest edge of a full-frame capture — matches roughly the tile size OpenAI's vision
+  // models downscale images to internally anyway, so capturing any larger just wastes upload
+  // bytes/base64 payload size without adding signal.
+  const FULL_FRAME_MAX_SIZE = 768;
+
+  // Captures the FULL, uncropped video frame at `time` — unlike captureOne, no rect/crop —
+  // for sending to an external image API (OpenAI Moderation) where cropping to just the
+  // detected box would remove the surrounding context a moderation check needs.
+  async function captureFullFrame(video, time) {
+    await seekTo(video, time);
+    const vw = video.videoWidth;
+    const vh = video.videoHeight;
+    if (!vw || !vh) return null;
+    const scale = Math.min(1, FULL_FRAME_MAX_SIZE / Math.max(vw, vh));
+    const dw = Math.max(1, Math.round(vw * scale));
+    const dh = Math.max(1, Math.round(vh * scale));
+    const canvas = document.createElement("canvas");
+    canvas.width = dw;
+    canvas.height = dh;
+    const ctx = canvas.getContext("2d");
+    ctx.drawImage(video, 0, 0, vw, vh, 0, 0, dw, dh);
+    return canvas.toDataURL("image/jpeg", 0.85);
+  }
+
+  // Same batching/reuse/cleanup shape as captureBatch (see its own comment), for full-frame
+  // captures instead of cropped thumbnails. `items` is [{time}, ...] — no `rect` needed.
+  async function captureFullFrameBatch(file, items, onOne) {
+    if (!file || !items || !items.length) return [];
+    const url = URL.createObjectURL(file);
+    const video = document.createElement("video");
+    video.muted = true;
+    video.playsInline = true;
+    video.preload = "auto";
+    video.style.position = "fixed";
+    video.style.left = "-99999px";
+    video.style.top = "0";
+    video.style.width = "1px";
+    video.style.height = "1px";
+    document.body.appendChild(video);
+    video.src = url;
+
+    const results = [];
+    try {
+      await new Promise((resolve, reject) => {
+        video.addEventListener("loadedmetadata", resolve, { once: true });
+        video.addEventListener(
+          "error",
+          () => reject(video.error || new Error("Could not load the video file for full-frame capture.")),
+          { once: true }
+        );
+      });
+
+      for (let i = 0; i < items.length; i++) {
+        let dataUrl = null;
+        try {
+          dataUrl = await captureFullFrame(video, items[i].time);
+        } catch (e) {
+          console.warn("Full-frame capture failed for one segment.", e);
+        }
+        results.push(dataUrl);
+        if (onOne) onOne(i, dataUrl);
+      }
+      return results;
+    } finally {
+      video.pause();
+      video.removeAttribute("src");
+      video.load();
+      video.remove();
+      URL.revokeObjectURL(url);
+    }
+  }
+
+  global.VMSnapshots = { captureBatch, captureFullFrameBatch };
 })(window);

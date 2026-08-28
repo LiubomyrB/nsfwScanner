@@ -413,6 +413,24 @@ async function detectBitmap(bitmap, minScore) {
 // only ever reflect one <video>.currentTime at a time), but queue defensively rather than
 // assume that: overlapping reader.read() calls on the same stream would corrupt matching.
 let classifyChain = Promise.resolve();
+
+// Forces a fresh ONNX session (see getSession — sessionPromise is otherwise cached forever,
+// including a REJECTED promise, which would make every future classify fail identically even
+// after whatever broke it recovers) and abandons whatever's stuck in classifyChain rather
+// than letting every future classify request queue up behind a link that itself never
+// settles. Triggered proactively here whenever a classify attempt cleanly throws (see
+// handleCoordinatorClassify's own .catch(), below — much faster than waiting on a timeout to
+// notice an error that already happened), and also by the coordinator's own classify timeout
+// (a request that got no response at all within CLASSIFY_TIMEOUT_MS — see scan-coordinator-
+// worker.js's classifyAt, for the case a request doesn't cleanly reject, e.g. an ONNX Runtime
+// Web WebGPU call left permanently awaiting a GPUBuffer.mapAsync() a lost GPU device will
+// never resolve or reject — reproduced directly by an unrelated tab's video playback crashing
+// the browser's whole GPU process).
+function resetSession() {
+  sessionPromise = null;
+  classifyChain = Promise.resolve();
+}
+
 function handleCoordinatorClassify(req) {
   const minScore = typeof req.minScore === "number" ? req.minScore : 0.2;
   console.log('handleCoordinatorClassify minScore', minScore, req.time)
@@ -432,6 +450,7 @@ function handleCoordinatorClassify(req) {
       }
     })
     .catch((err) => {
+      resetSession();
       coordinatorPort.postMessage({ id: req.id, ok: false, error: String((err && err.message) || err) });
     });
 }
@@ -462,6 +481,10 @@ self.onmessage = async (e) => {
     coordinatorPort.onmessage = (ev) => {
       if (ev.data && ev.data.type === "classify") handleCoordinatorClassify(ev.data);
       else if (ev.data && ev.data.type === "prefetchMediabunny") handlePrefetchMediabunny(ev.data.times);
+      else if (ev.data && ev.data.type === "resetSession") {
+        console.warn("nudenet-worker: forced session reset (coordinator reported a stuck/timed-out classify).");
+        resetSession();
+      }
     };
     return;
   }
@@ -484,3 +507,17 @@ self.onmessage = async (e) => {
 getSession()
   .then(() => self.postMessage({ ready: true, backend: isCrossOriginIsolated ? "onnx-wasm-mt" : "onnx-wasm" }))
   .catch((err) => self.postMessage({ ready: true, error: String((err && err.message) || err) }));
+
+// Safety net for exactly what a lost WebGPU device looks like in practice: ONNX Runtime
+// Web's WebGPU backend can leave an internal (not-awaited-by-us) promise — e.g. a GPUBuffer.
+// mapAsync() reading back a result — permanently pending when the device disappears out from
+// under it, which then rejects as an "AbortError: A valid external Instance reference no
+// longer exists" completely detached from the classifyChain we actually await, bypassing
+// handleCoordinatorClassify's own .catch() entirely (reproduced directly: an unrelated tab's
+// video playback crashed the browser's whole GPU process mid-scan). This is a faster
+// detection path than waiting on the coordinator's CLASSIFY_TIMEOUT_MS — it fires the moment
+// the rejection surfaces instead of only once a request has gone conspicuously quiet.
+self.addEventListener("unhandledrejection", (e) => {
+  console.warn("nudenet-worker: unhandled rejection (likely a lost GPU device) — resetting session.", e.reason);
+  resetSession();
+});

@@ -104,6 +104,17 @@
     return Array.from(picks.values());
   }
 
+  // How long to wait for nudenet-worker's response before treating a classify as stuck and
+  // forcing recovery, rather than hanging the whole scan forever. Reproduced directly: a GPU
+  // process crash/reset (e.g. triggered by something entirely unrelated — another tab's
+  // video playback crashing took the whole browser's GPU process down with it) can leave
+  // ONNX Runtime Web's WebGPU backend awaiting a GPUBuffer.mapAsync() that never resolves OR
+  // rejects — no response ever arrives, no matter how long the scan waits. 20s is generous
+  // relative to real per-frame costs (even background-tab-throttled runs stayed well under a
+  // second per frame during the background-throttling investigation — see that project
+  // memory), so this should only ever fire for a genuinely stuck request.
+  const CLASSIFY_TIMEOUT_MS = 20000;
+
   // Requests a classification from nudenet-worker for `time`, over the direct port — no
   // main-thread involvement in this round trip. Resolves to null if nudenet-worker found no
   // matching frame in time (rare — see its own FRAME_WAIT_TIMEOUT_MS) rather than throwing,
@@ -113,7 +124,20 @@
   function classifyAt(time, bitmap) {
     return new Promise((resolve, reject) => {
       const id = ++msgId;
-      pending.set(id, { resolve, reject });
+      const timer = setTimeout(() => {
+        if (!pending.has(id)) return; // a real (if late) response already arrived first
+        pending.delete(id);
+        // The stuck request is still occupying nudenet-worker's classifyChain — a promise
+        // chain that can never advance past a link that itself never settles — so every
+        // future classify would queue up behind it and time out identically otherwise.
+        // resetSession drops that dead link and forces a fresh ONNX session for what's next.
+        if (nudenetPort) nudenetPort.postMessage({ type: "resetSession" });
+        reject(new Error("classify timed out after " + CLASSIFY_TIMEOUT_MS + "ms — treating nudenet-worker as stuck and recovering"));
+      }, CLASSIFY_TIMEOUT_MS);
+      pending.set(id, {
+        resolve: (v) => { clearTimeout(timer); resolve(v); },
+        reject: (e) => { clearTimeout(timer); reject(e); },
+      });
       if (bitmap) {
         nudenetPort.postMessage({ type: "classify", id, time, bitmap, minScore: 0.2 }, [bitmap]);
       } else {

@@ -231,13 +231,10 @@
       let settled = false;
       let fallbackTimer = null;
 
- let time1 = performance.now()
       function finish() {
         if (settled) return;
         settled = true;
         video.removeEventListener("seeked", onSeeked);
-        console.log('set currentTime', time, (performance.now() - time1) / 1000)
-        console.trace();
         if (fallbackTimer) clearTimeout(fallbackTimer);
         resolve();
       }
@@ -942,22 +939,16 @@
           if (mode === "seek") {
             (async () => {
               try {
-                let time1 = performance.now();
                 await seekTo(video, msg.time);
-                console.log('seekTo', (performance.now() - time1) / 1000);
-                let time2 = performance.now();
                 const bitmap = await grabLetterboxBitmap(video, nudenetCanvas, nudenetCtx, NUDENET_INPUT_SIZE);
-                console.log('seekTo 2', (performance.now() - time1) / 1000);
                 coordinator.postMessage({ type: "frameReady", id: msg.id, bitmap }, [bitmap]);
               } catch (err) {
                 coordinator.postMessage({ type: "frameReady", id: msg.id, bitmap: null });
               }
             })();
           } else {
-            try { 
-                let time1 = performance.now()
+            try {
                 video.currentTime = msg.time;
-                console.log('set currentTime', (performance.now() - time1) / 1000)
             } catch (err) { /* ignore */ }
           }
         } else if (msg.type === "progress") {

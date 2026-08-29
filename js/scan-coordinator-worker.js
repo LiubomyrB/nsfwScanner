@@ -203,14 +203,11 @@
       nudenetPort.postMessage({ type: "prefetchMediabunny", times });
     }
     for (const time of times) {
-         let time0 = performance.now();
       if (cancelled) break;
       samplesCompleted++;
       let bitmap = null;
       if (mode === "seek") {
-        let timeR = performance.now();
         bitmap = await requestFrame(time);
-        console.log('sampleAtTimes bitmap', (performance.now() - timeR) / 1000)
         if (!bitmap) continue; // main thread couldn't seek/grab this one — skip it
       } else if (mode === "stream") {
         self.postMessage({ type: "seek", time });
@@ -219,21 +216,15 @@
       // by timestamp, straight off the source File.
       let data;
       try {
-        console.log('sampleAtTimes START')
-        let time1 = performance.now();
         data = await classifyAt(time, bitmap);
-        console.log('sampleAtTimes classifyAt', (performance.now() - time1) / 1000)
       } catch (e) {
         data = null;
       }
       if (data) {
         const sample = Object.assign({ time }, data);
         results.push(sample);
-        let timeS = performance.now();
         if (onSampleDone) onSampleDone(sample);
-        console.log('sampleAtTimes onSampleDone', (performance.now() - timeS) / 1000)
       }
-        console.log('sampleAtTimes FINISH', (performance.now() - time0) / 1000)
     }
     return results;
   }
@@ -304,13 +295,10 @@
     });
 
     if (cancelled) return coarseSamples;
-    console.log('scanAdaptive coarseSamples', coarseSamples.length)
     const margin = 0.2;
     const windows = [];
     const triggerTimes = [];
     for (const s of coarseSamples) {
-            console.log('scanAdaptive coarseSamples for', s.probability, Math.max(0, sensitivity - margin), sensitivity)
-
       // s.probability > 0 is required alongside the threshold check, not just the threshold
       // alone: Math.max(0, sensitivity - margin) clamps to exactly 0 whenever margin >=
       // sensitivity (e.g. sensitivity 0.09, margin 0.2 -> 0), and probability itself is never

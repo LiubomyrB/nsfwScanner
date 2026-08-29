@@ -99,13 +99,10 @@ function nms(boxes, scores, iouThresh) {
 // the upstream Python reference (sd-extension-nudenet's read_image()) prepares input, so
 // no further resizing happens here, just pixel extraction.
 async function detect(session, bitmap, minScore) {
-    let time0 = performance.now();
-
   const canvas = new OffscreenCanvas(INPUT_SIZE, INPUT_SIZE);
   const ctx = canvas.getContext("2d");
   ctx.drawImage(bitmap, 0, 0, INPUT_SIZE, INPUT_SIZE);
   const imgData = ctx.getImageData(0, 0, INPUT_SIZE, INPUT_SIZE).data;
-let time1 = performance.now();
   // HWC RGBA -> CHW RGB, normalized 0..1.
   const plane = INPUT_SIZE * INPUT_SIZE;
   const chw = new Float32Array(3 * plane);
@@ -116,26 +113,17 @@ let time1 = performance.now();
     chw[2 * plane + i] = imgData[o + 2] / 255;
   }
 
-  let time2 = performance.now();
-
   const tensor = new ort.Tensor("float32", chw, [1, 3, INPUT_SIZE, INPUT_SIZE]);
-console.log('detect 1', (performance.now() - time2) / 1000)
 
-
- let timeE = performance.now();
-  
   const feeds = {};
   feeds[session.inputNames[0]] = tensor;
 
   const results = await session.run(feeds);
-  console.log('detect E', (performance.now() - timeE) / 1000)
 
   const output = results[session.outputNames[0]]; // [1, 4+numClasses, numBoxes] (YOLO-style)
   const numAttrs = output.dims[1];
   const numBoxes = output.dims[2];
   const data = output.data;
-  let time3 = performance.now();
-    
 
   const boxes = [];
   const scores = [];
@@ -158,7 +146,6 @@ console.log('detect 1', (performance.now() - time2) / 1000)
     }
   }
   const keep = nms(boxes, scores, 0.45);
-    console.log('detect 2', (performance.now() - time3) / 1000)
 
   let maxConfirmScore = 0;
   let maxConfirmLabel;
@@ -171,8 +158,6 @@ console.log('detect 1', (performance.now() - time2) / 1000)
   // its max score — lets callers crop a snapshot of exactly what triggered the detection
   // (see scanner.js's letterboxBoxToVideoFraction, which maps this space back to the real
   // video frame once the actual video dimensions are known).
-    let time4 = performance.now();
-
   const classBoxes = {};
   for (const label of CONFIRM_LABELS) {
     classScores[label] = 0;
@@ -196,12 +181,6 @@ console.log('detect 1', (performance.now() - time2) / 1000)
       }
     }
   }
-    
-  console.log('detect parts 1', parts, scores)
-  console.log('detect parts 2', { matched: parts.length > 0, maxScore: maxConfirmScore, label: maxConfirmLabel, classScores, classBoxes, parts })
-
-console.log('detect 3', (performance.now() - time4) / 1000)
-console.log('detect F', (performance.now() - time0) / 1000)
 
   return { matched: parts.length > 0, maxScore: maxConfirmScore, label: maxConfirmLabel, classScores, classBoxes, parts };
 }
@@ -290,8 +269,6 @@ const FRAME_WAIT_TIMEOUT_MS = 1000;
 // Drains the stream until a frame at/after `time` arrives, discarding stale (pre-seek)
 // frames along the way. Returns null if nothing matches within the deadline.
 async function getFrameAt(time) {
-  let drainStart = performance.now();
-  let discarded = 0;
   const deadline = Date.now() + FRAME_WAIT_TIMEOUT_MS;
   while (Date.now() < deadline) {
     const remaining = deadline - Date.now();
@@ -305,13 +282,10 @@ async function getFrameAt(time) {
 
     const frameTime = value.timestamp / 1e6;
     if (frameTime >= time) {
-      console.log('getFrameAt drained', discarded, 'frames in', (performance.now() - drainStart) / 1000, 's for time', time)
       return value;
     }
-    discarded++;
     value.close();
   }
-  console.log('getFrameAt drained', discarded, 'frames in', (performance.now() - drainStart) / 1000, 's for time', time, '(no match / timed out)')
   return null;
 }
 
@@ -334,7 +308,6 @@ function letterboxGeometry(vw, vh, size) {
 // a VideoFrame pulled off the stream instead of a <video> element, and staying entirely in
 // this worker (no canvas/bitmap hop back through the main thread).
 async function detectAtTime(time, minScore) {
-    let time1 = performance.now();
   const frame = await getFrameAt(time);
   if (!frame) return null;
   const vw = frame.displayWidth || 1;
@@ -347,12 +320,8 @@ async function detectAtTime(time, minScore) {
   ctx.drawImage(frame, 0, 0, vw, vh, padLeft, padTop, newW, newH);
   frame.close();
   const bitmap = await createImageBitmap(canvas);
-    console.log('detectAtTime 1', (performance.now() - time1) / 1000)
   const session = await getSession();
-
-    let time2 = performance.now();
   const result = await detect(session, bitmap, minScore);
-    console.log('detectAtTime 2', (performance.now() - time2) / 1000)
   bitmap.close();
   return result;
 }
@@ -362,7 +331,6 @@ async function detectAtTime(time, minScore) {
 // MediaStreamTrackProcessor stream — same letterbox treatment, just reading a VideoSample
 // (mediabunny's near-zero-cost VideoFrame wrapper) instead of a raw VideoFrame.
 async function detectAtTimeMediabunny(time, minScore) {
-  let time0 = performance.now();
   await mediabunnyReadyPromise;
   let sample;
   if (mediabunnySampleIterator) {
@@ -374,7 +342,6 @@ async function detectAtTimeMediabunny(time, minScore) {
   } else {
     sample = await mediabunnySink.getSample(time);
   }
-  console.log('detectAtTimeMediabunny getSample', (performance.now() - time0) / 1000, time)
   if (!sample) return null;
   const vw = sample.displayWidth || 1;
   const vh = sample.displayHeight || 1;
@@ -385,16 +352,10 @@ async function detectAtTimeMediabunny(time, minScore) {
   ctx.fillRect(0, 0, INPUT_SIZE, INPUT_SIZE);
   sample.draw(ctx, padLeft, padTop, newW, newH);
   sample.close();
-  let time1 = performance.now();
   const bitmap = await createImageBitmap(canvas);
-    console.log('detectAtTimeMediabunny createImageBitmap', (performance.now() - time1) / 1000)
-
-  let time2 = performance.now();
   const session = await getSession();
   const result = await detect(session, bitmap, minScore);
   bitmap.close();
-    console.log('detectAtTimeMediabunny detect', (performance.now() - time2) / 1000)
-    console.log('detectAtTimeMediabunny F', (performance.now() - time0) / 1000)
   return result;
 }
 
@@ -433,13 +394,10 @@ function resetSession() {
 
 function handleCoordinatorClassify(req) {
   const minScore = typeof req.minScore === "number" ? req.minScore : 0.2;
-  console.log('handleCoordinatorClassify minScore', minScore, req.time)
   classifyChain = classifyChain
     .then(() => {
       if (req.bitmap) return detectBitmap(req.bitmap, minScore);
-      let time1 = performance.now();
       if (frameAcquisitionMode === "mediabunny") return detectAtTimeMediabunny(req.time, minScore);
-      console.log('handleCoordinatorClassify 1', (performance.now() - time1) / 1000)
       return detectAtTime(req.time, minScore);
     })
     .then((result) => {

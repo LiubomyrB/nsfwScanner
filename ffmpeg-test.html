@@ -1,0 +1,362 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>FFmpeg test page</title>
+<style>
+  :root {
+    --bg: #101114; --panel: #1b1d22; --text: #eef0f3; --dim: #9aa0ab;
+    --accent: #5b8def; --accent-hover: #7aa2f2; --border: #2c2f36;
+    --bad: #e2574c; --good: #4caf7d;
+  }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0; padding: 0; min-height: 100%;
+    background: var(--bg); color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  }
+  body { padding: 24px; }
+  h1 { font-size: 20px; margin: 0 0 4px; }
+  .subtitle { color: var(--dim); font-size: 13px; margin: 0 0 20px; max-width: 760px; line-height: 1.5; }
+  .layout { display: flex; gap: 24px; flex-wrap: wrap; align-items: flex-start; }
+  .left { flex: 1 1 480px; min-width: 320px; }
+  .right { flex: 1 1 360px; min-width: 320px; max-width: 460px; }
+
+  #dropZone {
+    border: 2px dashed var(--border);
+    border-radius: 12px;
+    padding: 28px;
+    text-align: center;
+    color: var(--dim);
+    cursor: pointer;
+    transition: border-color .15s ease, color .15s ease;
+  }
+  #dropZone.drag { border-color: var(--accent); color: var(--text); }
+  #dropZone .big-btn {
+    background: var(--accent); color: #fff; border: none; padding: 12px 22px;
+    font-size: 15px; border-radius: 10px; cursor: pointer; margin-top: 10px;
+  }
+  #dropZone .big-btn:hover { background: var(--accent-hover); }
+  #fileInput { display: none; }
+
+  .panel {
+    background: var(--panel); border: 1px solid var(--border); border-radius: 12px;
+    padding: 16px 18px; margin-bottom: 16px;
+  }
+  .panel h3 { margin: 0 0 10px; font-size: 14px; }
+  .row { display: flex; justify-content: space-between; font-size: 13px; padding: 3px 0; gap: 12px; }
+  .row .k { color: var(--dim); }
+  .row .v { text-align: right; word-break: break-all; }
+
+  .field { display: flex; flex-direction: column; gap: 8px; font-size: 13px; margin-bottom: 12px; }
+  .radio-field, .checkbox-field { display: flex; align-items: center; gap: 8px; font-size: 13px; margin-bottom: 6px; }
+  .hint { color: var(--dim); font-size: 12px; line-height: 1.4; margin: 2px 0 0; }
+
+  button.btn {
+    background: var(--accent); color: #fff; border: none; padding: 10px 18px;
+    font-size: 14px; border-radius: 8px; cursor: pointer;
+  }
+  button.btn:hover { background: var(--accent-hover); }
+  button.btn:disabled { background: #3a3d44; color: var(--dim); cursor: not-allowed; }
+  button.btn.secondary { background: #2c2f36; }
+  button.btn.secondary:hover { background: #3a3d44; }
+
+  .progress-outer { background: #2c2f36; border-radius: 999px; height: 10px; overflow: hidden; margin: 10px 0 4px; }
+  .progress-inner { background: var(--accent); height: 100%; width: 0%; transition: width .15s ease; }
+  #statusLine { color: var(--dim); font-size: 13px; min-height: 18px; }
+  #statusLine.error { color: var(--bad); }
+  #statusLine.ok { color: var(--good); }
+
+  #logConsole {
+    background: #0a0b0d; border: 1px solid var(--border); border-radius: 8px;
+    padding: 10px 12px; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 11.5px; line-height: 1.5; color: #b7c2d0; height: 260px; overflow-y: auto;
+    white-space: pre-wrap; word-break: break-all;
+  }
+  #liveMetrics { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 13px; color: var(--good); min-height: 18px; }
+
+  a.back { color: var(--dim); font-size: 13px; text-decoration: none; }
+  a.back:hover { color: var(--text); }
+  a.downloadLink { color: var(--accent); font-size: 13px; }
+</style>
+</head>
+<body>
+
+<a class="back" href="index.html">&larr; back to Video Moderator</a>
+<h1 style="margin-top:12px;">FFmpeg test page</h1>
+<p class="subtitle">Pick any file and run it through the same FFmpeg.wasm operations the main
+  app uses (audio-only remux, full re-encode, or just the playability check) — with live raw
+  FFmpeg log output (the same frame=/fps=/speed= lines a native <code>ffmpeg</code> invocation
+  prints) so you can compare directly against running the equivalent command in a terminal.
+  Runs entirely in your browser; nothing is uploaded anywhere.</p>
+
+<div class="layout">
+  <div class="left">
+    <div id="dropZone">
+      Drag &amp; drop any file here, or
+      <div><button class="big-btn" id="pickBtn" type="button">Choose File</button></div>
+    </div>
+    <input type="file" id="fileInput">
+
+    <div class="panel" id="fileInfoPanel" style="display:none; margin-top:16px;">
+      <h3>File</h3>
+      <div class="row"><span class="k">Name</span><span class="v" id="infoName"></span></div>
+      <div class="row"><span class="k">Size</span><span class="v" id="infoSize"></span></div>
+      <div class="row"><span class="k">Type</span><span class="v" id="infoType"></span></div>
+    </div>
+
+    <div class="panel" id="resultsPanel" style="display:none;">
+      <h3>Result</h3>
+      <div class="row"><span class="k">Elapsed</span><span class="v" id="resElapsed"></span></div>
+      <div class="row"><span class="k">Input filesystem</span><span class="v" id="resInputMode"></span></div>
+      <div class="row"><span class="k">Output size</span><span class="v" id="resSize"></span></div>
+      <div class="row"><span class="k">Saved to</span><span class="v" id="resSaved"></span></div>
+      <div class="row" id="resDownloadRow" style="display:none;"><span class="k">File</span><span class="v"><a class="downloadLink" id="resDownloadLink">Download</a></span></div>
+    </div>
+
+    <div class="panel">
+      <h3>Live FFmpeg output</h3>
+      <div id="liveMetrics"></div>
+      <div id="logConsole"></div>
+    </div>
+  </div>
+
+  <div class="right">
+    <div class="panel">
+      <h3>Operation</h3>
+      <label class="radio-field">
+        <input type="radio" name="op" id="opCheck" value="check" checked>
+        <span>Check playability only (no transcode)</span>
+      </label>
+      <label class="radio-field">
+        <input type="radio" name="op" id="opAudio" value="audio">
+        <span>Remux audio only (<code>-c:v copy -c:a aac</code>)</span>
+      </label>
+      <label class="radio-field">
+        <input type="radio" name="op" id="opFull" value="full">
+        <span>Full transcode (<code>libx264</code> + <code>aac</code>)</span>
+      </label>
+      <p class="hint">These are the exact two transcode paths the main app uses — audio-only
+        is the fast/lossless path for a file whose video already plays fine but whose audio
+        codec doesn't (e.g. AC3); full transcode re-encodes everything and is the fallback
+        when the video/container itself isn't playable.</p>
+
+      <h3 style="margin-top:16px;">Input filesystem</h3>
+      <label class="radio-field">
+        <input type="radio" name="inputMode" id="inputWorkerfs" value="workerfs" checked>
+        <span>WORKERFS (default, what the app uses)</span>
+      </label>
+      <label class="radio-field">
+        <input type="radio" name="inputMode" id="inputMemfs" value="memfs">
+        <span>MEMFS (old approach: reads the whole file into memory first)</span>
+      </label>
+      <p class="hint">WORKERFS gives FFmpeg on-demand read access to the file straight from the
+        browser's own Blob storage, without duplicating it into JS/WASM memory first — the app
+        switched to this to avoid out-of-memory crashes on large files. MEMFS is the simpler,
+        older approach (<code>fetchFile()</code> into a JS <code>ArrayBuffer</code>, then
+        <code>writeFile()</code> into FFmpeg's virtual filesystem) — needs roughly 2x the file
+        size in memory just to stage the input, but has less per-read overhead once staged,
+        which can matter for I/O-heavy operations like a <code>-c:v copy</code> remux. Ignored
+        for "Check playability only" (that op never touches FFmpeg at all).</p>
+
+      <label class="checkbox-field" id="saveToDiskField">
+        <input type="checkbox" id="saveToDiskInput">
+        <span>Save output to disk instead of memory</span>
+      </label>
+      <p class="hint" id="saveToDiskHint">Streams the result straight to a file you choose,
+        in bounded chunks, instead of holding the whole thing in browser memory at once —
+        matters for large files. Requires a browser with the File System Access API.</p>
+
+      <button class="btn" id="runBtn" type="button" disabled>Pick a file first</button>
+      <button class="btn secondary" id="cancelBtn" type="button" style="display:none;">Cancel</button>
+    </div>
+
+    <div class="panel">
+      <h3>Progress</h3>
+      <div class="progress-outer"><div class="progress-inner" id="progressBar"></div></div>
+      <div id="statusLine">No file loaded yet.</div>
+    </div>
+  </div>
+</div>
+
+<script src="js/transcoder.js"></script>
+<script>
+(function () {
+  const els = {};
+  ["dropZone", "pickBtn", "fileInput", "fileInfoPanel", "infoName", "infoSize", "infoType",
+   "resultsPanel", "resElapsed", "resInputMode", "resSize", "resSaved", "resDownloadRow", "resDownloadLink",
+   "logConsole", "liveMetrics", "opCheck", "opAudio", "opFull", "inputWorkerfs", "inputMemfs",
+   "saveToDiskField", "saveToDiskInput", "saveToDiskHint", "runBtn", "cancelBtn", "progressBar",
+   "statusLine",
+  ].forEach((id) => { els[id] = document.getElementById(id); });
+
+  let currentFile = null;
+  let cancelToken = null;
+  let currentObjectUrl = null;
+
+  if (!window.showSaveFilePicker) {
+    els.saveToDiskInput.disabled = true;
+    els.saveToDiskHint.textContent = "Not available in this browser (needs the File System Access API — Chrome/Edge).";
+  }
+
+  els.pickBtn.addEventListener("click", () => els.fileInput.click());
+  els.dropZone.addEventListener("click", (e) => { if (e.target === els.dropZone) els.fileInput.click(); });
+  els.fileInput.addEventListener("change", () => {
+    if (els.fileInput.files && els.fileInput.files[0]) setFile(els.fileInput.files[0]);
+  });
+  els.dropZone.addEventListener("dragover", (e) => { e.preventDefault(); els.dropZone.classList.add("drag"); });
+  els.dropZone.addEventListener("dragleave", () => els.dropZone.classList.remove("drag"));
+  els.dropZone.addEventListener("drop", (e) => {
+    e.preventDefault();
+    els.dropZone.classList.remove("drag");
+    const f = e.dataTransfer.files && e.dataTransfer.files[0];
+    if (f) setFile(f);
+  });
+
+  function setFile(file) {
+    currentFile = file;
+    els.infoName.textContent = file.name;
+    els.infoSize.textContent = formatBytes(file.size);
+    els.infoType.textContent = file.type || "(unknown)";
+    els.fileInfoPanel.style.display = "";
+    els.resultsPanel.style.display = "none";
+    els.runBtn.disabled = false;
+    els.runBtn.textContent = "Run";
+    setStatus("Ready.", null);
+  }
+
+  function formatBytes(n) {
+    if (n < 1024) return n + " B";
+    const units = ["KB", "MB", "GB"];
+    let v = n;
+    for (const u of units) {
+      v /= 1024;
+      if (v < 1024) return v.toFixed(2) + " " + u;
+    }
+    return v.toFixed(2) + " TB";
+  }
+
+  function setStatus(text, kind) {
+    els.statusLine.textContent = text;
+    els.statusLine.className = kind || "";
+  }
+
+  function setProgress(pct) {
+    els.progressBar.style.width = Math.max(0, Math.min(100, pct)) + "%";
+  }
+
+  function appendLog(line) {
+    const atBottom = els.logConsole.scrollTop + els.logConsole.clientHeight >= els.logConsole.scrollHeight - 4;
+    els.logConsole.textContent += line + "\n";
+    if (atBottom) els.logConsole.scrollTop = els.logConsole.scrollHeight;
+
+    // Mirror the same frame=/fps=/speed= line ffmpeg prints natively, pulled out on its own
+    // so it's easy to compare against a terminal run without hunting through the scrollback.
+    const m = line.match(/frame=\s*(\d+)\s+fps=\s*([\d.]+).*?speed=\s*([\d.]+)x/);
+    if (m) {
+      els.liveMetrics.textContent = `frame=${m[1]}  fps=${m[2]}  speed=${m[3]}x`;
+    }
+  }
+
+  let unsubscribeLog = null;
+  if (window.VMTranscoder && window.VMTranscoder.onLog) {
+    unsubscribeLog = window.VMTranscoder.onLog(appendLog);
+  }
+
+  els.cancelBtn.addEventListener("click", () => {
+    if (cancelToken) cancelToken.cancel();
+  });
+
+  els.runBtn.addEventListener("click", async () => {
+    if (!currentFile) return;
+    const op = document.querySelector('input[name="op"]:checked').value;
+
+    els.logConsole.textContent = "";
+    els.liveMetrics.textContent = "";
+    els.resultsPanel.style.display = "none";
+    setProgress(0);
+    els.runBtn.disabled = true;
+    els.cancelBtn.style.display = "";
+
+    const startTime = performance.now();
+    try {
+      if (op === "check") {
+        setStatus("Checking playability…", null);
+        const result = await window.VMTranscoder.checkPlayability(currentFile);
+        const elapsed = ((performance.now() - startTime) / 1000).toFixed(2);
+        setStatus(
+          `Done in ${elapsed}s — video playable: ${result.videoOk}, fully playable (incl. audio): ${result.ok}`,
+          result.ok ? "ok" : (result.videoOk ? "" : "error")
+        );
+        setProgress(100);
+      } else {
+        // Best-effort save-to-disk, same as the main app: prompt for a location right away
+        // (as close to the click as possible) if requested and available, falling back to
+        // in-memory if it's unavailable, cancelled, or fails for any reason.
+        let saveHandle = null;
+        if (els.saveToDiskInput.checked && window.showSaveFilePicker) {
+          try {
+            const dotIdx = currentFile.name.lastIndexOf(".");
+            const ext = op === "full" ? ".mp4" : (dotIdx >= 0 ? currentFile.name.slice(dotIdx) : ".mkv");
+            const base = dotIdx > 0 ? currentFile.name.slice(0, dotIdx) : currentFile.name;
+            const mimeType = op === "full" ? "video/mp4" : (currentFile.type || "video/x-matroska");
+            saveHandle = await window.showSaveFilePicker({
+              suggestedName: base + ext,
+              types: [{ description: "Video", accept: { [mimeType]: [ext] } }],
+            });
+          } catch (e) {
+            if (e && e.name !== "AbortError") console.warn("Save picker failed, using in-memory output.", e);
+            saveHandle = null;
+          }
+        }
+
+        const inputMode = document.querySelector('input[name="inputMode"]:checked').value;
+
+        cancelToken = window.VMTranscoder.createCancelToken();
+        const transcodeFn = op === "full" ? window.VMTranscoder.transcodeToMp4 : window.VMTranscoder.remuxAudioOnly;
+        const result = await transcodeFn(currentFile, {
+          onProgress: setProgress,
+          onStatus: (msg) => setStatus(msg, null),
+          token: cancelToken,
+          saveHandle,
+          inputMode,
+        });
+
+        const elapsedSec = (performance.now() - startTime) / 1000;
+        setStatus(`Done in ${elapsedSec.toFixed(2)}s (input: ${inputMode}).`, "ok");
+        setProgress(100);
+
+        els.resElapsed.textContent = elapsedSec.toFixed(2) + "s";
+        els.resInputMode.textContent = inputMode;
+        els.resSize.textContent = formatBytes(result.file.size);
+        els.resSaved.textContent = result.savedToDisk ? "disk (chosen location)" : "browser memory";
+        if (!result.savedToDisk) {
+          if (currentObjectUrl) URL.revokeObjectURL(currentObjectUrl);
+          currentObjectUrl = URL.createObjectURL(result.file);
+          els.resDownloadLink.href = currentObjectUrl;
+          els.resDownloadLink.download = result.file.name;
+          els.resDownloadRow.style.display = "";
+        } else {
+          els.resDownloadRow.style.display = "none";
+        }
+        els.resultsPanel.style.display = "";
+      }
+    } catch (e) {
+      if (e && e.cancelled) {
+        setStatus("Cancelled.", null);
+      } else {
+        console.error(e);
+        setStatus("Failed: " + (e && e.message ? e.message : e), "error");
+      }
+      setProgress(0);
+    } finally {
+      els.runBtn.disabled = false;
+      els.cancelBtn.style.display = "none";
+      cancelToken = null;
+    }
+  });
+})();
+</script>
+</body>
+</html>

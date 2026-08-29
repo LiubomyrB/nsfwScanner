@@ -1,0 +1,8 @@
+# Apache/mod_php often doesn't pass the Authorization header through to PHP by default (it's
+# stripped before $_SERVER is populated) unless explicitly told to — this is that. Harmless
+# and ignored under nginx (which doesn't read .htaccess at all; nginx needs
+# `fastcgi_pass_header Authorization;` or equivalent in its own server config instead, if the
+# request stack ever changes).
+RewriteEngine On
+RewriteCond %{HTTP:Authorization} ^(.*)
+RewriteRule .* - [E=HTTP_AUTHORIZATION:%{HTTP:Authorization}]

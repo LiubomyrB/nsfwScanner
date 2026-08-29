@@ -1,0 +1,1259 @@
+// @ts-nocheck — plain multi-file classic-script app; globals (VMDB/VMScanner/VMTranscoder/tf/nsfwjs) are wired via <script> load order, not modules.
+// Nudity scanning of a local video File, plus segment/text helpers.
+//
+// Two classifiers are available (picked via `detectionMode`, see scanVideoFile):
+//   - NSFWJS (js/scan-worker.js) — cheap whole-frame classifier. Fast, but can flag a lot
+//     of visible skin (bare neck/shoulders/midriff) as nudity with no real anatomical
+//     understanding.
+//   - NudeNet (js/nudenet-worker.js) — a real body-part *object detector*. Only counts a
+//     frame as nudity if it actually finds an exposed breast/genital/anus region — not
+//     "skin in general" — but its per-call cost is much higher (see MAX_CONFIRMS_PER_RUN
+//     comment) and roughly fixed regardless of input size.
+// Three modes combine them differently:
+//   - "nsfwjs": NSFWJS only.
+//   - "confirm" (default): NSFWJS scans everything cheaply, then NudeNet double-checks only
+//     the (usually small) subset of frames NSFWJS flagged — good speed/accuracy balance.
+//   - "nudenet": NudeNet is the primary/only classifier for every sampled frame — most
+//     accurate (NSFWJS never gets a vote), but the slowest option.
+// Both run in worker pools, pipelined with main-thread video seeking, instead of blocking
+// the main thread on one call at a time. NSFWJS's worker picks WebGL or WASM for itself
+// depending on whether it detects real GPU acceleration or a software renderer. NudeNet's
+// worker uses ONNX Runtime Web's multi-threaded WASM backend (not TensorFlow.js/WebGL) —
+// verified ~40-110ms per frame here vs ~25-30 SECONDS for the previous TFJS-based model,
+// and unlike WebGL that speed doesn't depend on real GPU acceleration being available.
+(function (global) {
+  const IMAGE_SIZE = 224;
+  const NUDENET_INPUT_SIZE = 320; // fixed square input the ONNX model expects
+  // How low an NSFWJS score has to be to skip NudeNet confirmation entirely — deliberately
+  // generous (well below typical sensitivity settings) so confirmation isn't the thing
+  // that causes a miss; it only exists to filter out the clearly-clean majority of frames.
+  const PREFILTER_FLOOR = 0.15;
+
+  // The threshold used when building the segments that get written to the exported txt file
+  // and stored as the scan's permanent record — deliberately NOT `settings.sensitivity`. The
+  // sensitivity slider controls blur-during-playback only (recomputed live from the raw
+  // per-sample probabilities every time it's changed — see app.js's recomputeActiveSegments/
+  // loadPlayerWithData), and playback is the only place it should apply; anything a scan
+  // finds should be preserved on disk regardless of what the slider happens to be set to at
+  // scan time; a low sensitivity later shouldn't mean data quietly never got recorded in the
+  // first place. Still needs SOME positive floor (not 0) — merging on literal zero would pull
+  // in essentially every sample as "detected" (near-zero noise never actually reads as
+  // exactly 0) and collapse the whole video into one meaningless segment.
+  const REPORT_FLOOR = 0.05;
+
+  // Mirrors nudenet-worker.js's own CONFIRM_LABELS — the 5 body-part classes a per-sample
+  // classScores map (see nudenet-worker.js's detect()) can carry a score for. Duplicated
+  // here rather than shared across the worker/main-thread boundary (this classic-script app
+  // has no module system to share a constant through) — keep both lists in sync if either
+  // changes. `i18nKey` is the single source of truth for each class's human-readable name —
+  // app.js's per-class sensitivity sliders and the snapshot grid captions, and this file's
+  // own segmentsToTxt (see classDisplayName), all read the same translations through it
+  // rather than keeping their own separate copies.
+  const CONFIRM_CLASSES = [
+    { key: "female-breast-bare", i18nKey: "settings.classFemaleBreastBare" },
+    { key: "female-vagina", i18nKey: "settings.classFemaleVagina" },
+    { key: "male-penis", i18nKey: "settings.classMalePenis" },
+    { key: "anus-bare", i18nKey: "settings.classAnusBare" },
+    { key: "buttocks-bare", i18nKey: "settings.classButtocksBare" },
+  ];
+  const CONFIRM_LABELS = CONFIRM_CLASSES.map((c) => c.key);
+  const CONFIRM_CLASS_I18N_BY_KEY = {};
+  CONFIRM_CLASSES.forEach((c) => { CONFIRM_CLASS_I18N_BY_KEY[c.key] = c.i18nKey; });
+
+  // The human-readable name for a detected body-part class (e.g. "female-breast-bare" ->
+  // "Female breast") — null if `label` isn't a recognized class (undefined/legacy samples
+  // with no per-class breakdown at all).
+  function classDisplayName(label) {
+    const i18nKey = label && CONFIRM_CLASS_I18N_BY_KEY[label];
+    if (!i18nKey) return null;
+    return (global.VMI18n && global.VMI18n.t(i18nKey)) || label;
+  }
+
+  // Resolve the worker scripts relative to *this script's* own location (same reasoning as
+  // transcoder.js's vendored-module path) so it keeps working regardless of what directory
+  // index.html is served from.
+  const scriptBase = document.currentScript ? document.currentScript.src : document.baseURI;
+  const WORKER_URLS = {
+    nsfw: new URL("./scan-worker.js", scriptBase).href,
+    nudenet: new URL("./nudenet-worker.js", scriptBase).href,
+  };
+  const FRAME_READER_WORKER_URL = new URL("./frame-reader-worker.js", scriptBase).href;
+  const SCAN_COORDINATOR_WORKER_URL = new URL("./scan-coordinator-worker.js", scriptBase).href;
+
+  const pools = { nsfw: null, nudenet: null };
+  const rrCounters = { nsfw: 0, nudenet: 0 };
+  let msgId = 0;
+
+  function poolSizeFor(kind) {
+    const hw = navigator.hardwareConcurrency || 4;
+    if (kind === "nudenet") {
+      // NudeNet's ONNX Runtime Web worker already multi-threads *within* a single call
+      // (ort.env.wasm.numThreads = hardwareConcurrency, set in nudenet-worker.js) — a
+      // pool of several such workers would have each one trying to claim every core,
+      // oversubscribing and fighting itself rather than helping. One worker is enough:
+      // at ~40-110ms/call that's still ~10+ frames/sec, plenty for how this is used.
+      return 1;
+    }
+    // Leave a core free for the main thread/UI.
+    return Math.max(1, Math.min(4, hw - 1));
+  }
+
+  // Lazily spins up a pool of workers of the given kind ("nsfw" or "nudenet") and waits
+  // for each to finish loading its model. Pools are module-level singletons: they survive
+  // across scans/rescans in the same page session so a rescan doesn't pay worker-startup +
+  // model-load cost again. The "nudenet" pool (and its ~70MB download) is never created at
+  // all unless a scan actually uses NudeNet (confirmation or primary).
+  //
+  // `roleLabel` is purely cosmetic (what the status messages call this pool) — the same
+  // "nudenet" pool serves both "confirmation" (confirmWithNudeNet) and "detector" (NudeNet
+  // as the primary/only classifier) roles depending on the caller, and those deserve
+  // different wording so the status text doesn't say "confirming" when nothing is actually
+  // being confirmed.
+  function getWorkerPool(kind, onStatus, roleLabel) {
+    const roleKey = roleLabel || (kind === "nudenet" ? "confirmation" : "scan");
+    if (!pools[kind]) {
+      // A worker that never reports readiness (stuck CDN fetch, transient network failure,
+      // etc.) would otherwise hang the whole scan silently forever — so each worker gets a
+      // hard startup deadline. NudeNet gets a longer one: it downloads a much bigger model.
+      const startupTimeoutMs = kind === "nudenet" ? 90000 : 45000;
+      pools[kind] = (async () => {
+        const size = poolSizeFor(kind);
+        if (onStatus) onStatus(VMI18n.t("scan.statusStartingWorkers", { count: size, role: VMI18n.t("scan.workerRole." + roleKey) }));
+        const entries = Array.from({ length: size }, () => ({ worker: new Worker(WORKER_URLS[kind]) }));
+        try {
+          await Promise.all(
+            entries.map(
+              (entry) =>
+                new Promise((resolve, reject) => {
+                  const timer = setTimeout(
+                    () => reject(new Error(`Timed out waiting for a ${kind} worker to start.`)),
+                    startupTimeoutMs
+                  );
+                  function onMessage(e) {
+                    if (!e.data || !e.data.ready) return;
+                    clearTimeout(timer);
+                    entry.worker.removeEventListener("message", onMessage);
+                    entry.backend = e.data.backend;
+                    if (e.data.error) reject(new Error(e.data.error));
+                    else resolve();
+                  }
+                  entry.worker.addEventListener("message", onMessage);
+                  entry.worker.addEventListener(
+                    "error",
+                    (e) => {
+                      clearTimeout(timer);
+                      reject(new Error(e.message || `${kind} worker failed to start.`));
+                    },
+                    { once: true }
+                  );
+                })
+            )
+          );
+        } catch (e) {
+          // Don't leave a permanently-broken pool cached: a transient failure (flaky CDN
+          // request, etc.) should be retryable on the next scan attempt, not require a
+          // page reload.
+          entries.forEach((entry) => { try { entry.worker.terminate(); } catch (e2) { /* ignore */ } });
+          pools[kind] = null;
+          throw e;
+        }
+        if (onStatus) {
+          const backend = entries[0] && entries[0].backend;
+          onStatus(VMI18n.t("scan.statusUsingWorkers", { count: size, role: VMI18n.t("scan.workerRole." + roleKey), backend }));
+        }
+        return entries;
+      })();
+    }
+    return pools[kind];
+  }
+
+  // Sends one message to the next worker in `pool` (simple round-robin) and resolves with
+  // its reply payload.
+  function dispatchToPool(kind, pool, message, transfer) {
+    const entry = pool[rrCounters[kind] % pool.length];
+    rrCounters[kind]++;
+    const id = ++msgId;
+    return new Promise((resolve, reject) => {
+      function onMessage(e) {
+        if (!e.data || e.data.id !== id) return;
+        entry.worker.removeEventListener("message", onMessage);
+        if (e.data.ok) resolve(e.data);
+        else reject(new Error(e.data.error || "Worker call failed."));
+      }
+      entry.worker.addEventListener("message", onMessage);
+      entry.worker.postMessage(Object.assign({ id }, message), transfer);
+    });
+  }
+
+  function classifyNSFW(pool, bitmap) {
+    return dispatchToPool("nsfw", pool, { bitmap }, [bitmap]).then((r) => ({ probability: r.probability, label: r.label }));
+  }
+
+  function classifyNudeNet(pool, bitmap) {
+    return dispatchToPool("nudenet", pool, { bitmap, minScore: 0.2 }, [bitmap])
+      .then((r) => ({ matched: r.matched, maxScore: r.maxScore, label: r.label, classScores: r.classScores, classBoxes: r.classBoxes }));
+  }
+
+  // Same shape as classifyNSFW ({probability, label}), for code paths that use NudeNet as a
+  // primary/standalone classifier rather than a confirmation step. `label` (the specific
+  // body-part class NudeNet matched, e.g. "female-breast-bare") is only meaningful when
+  // something was actually matched — left undefined otherwise, same as classifyNSFW leaves
+  // it undefined for nothing-interesting frames it never even attempts a label for.
+  // `classScores`/`classBoxes` (per-class max score and the box that earned it) are always
+  // present regardless of `matched` — they're what applyClassThresholds re-filters samples
+  // by and reads a snapshot crop rectangle from.
+  function classifyNudeNetAsProbability(pool, bitmap) {
+    return classifyNudeNet(pool, bitmap).then((r) => ({
+      probability: r.matched ? r.maxScore : 0,
+      label: r.matched ? r.label : undefined,
+      classScores: r.classScores,
+      classBoxes: r.classBoxes,
+    }));
+  }
+
+  function createCancelToken() {
+    return {
+      cancelled: false,
+      // Optional callback a caller can attach for an immediate side effect on cancel — used
+      // by runCoordinatedNudeNetScan to forward cancellation straight to the coordinator
+      // worker, rather than relying on it to notice a shared flag it can't actually observe
+      // (workers don't share JS object references with the main thread).
+      onCancel: null,
+      cancel() {
+        this.cancelled = true;
+        if (this.onCancel) this.onCancel();
+      },
+    };
+  }
+
+  function seekTo(video, time) {
+    return new Promise((resolve) => {
+      let settled = false;
+      let fallbackTimer = null;
+
+      function finish() {
+        if (settled) return;
+        settled = true;
+        video.removeEventListener("seeked", onSeeked);
+        if (fallbackTimer) clearTimeout(fallbackTimer);
+        resolve();
+      }
+      function onSeeked() {
+        video.removeEventListener("seeked", onSeeked);
+        // Confirm the seeked frame has actually been decoded/presented before drawImage
+        // reads it — reading immediately on "seeked" can still return the previous frame
+        // (reproduced directly). requestVideoFrameCallback (when available) is the correct,
+        // purpose-built signal for this; a double rAF is the fallback for browsers without
+        // it (Safari).
+        //
+        // Neither is guaranteed to fire while the tab is in the background — both are tied
+        // to the rendering/compositor pipeline, which gets throttled or paused entirely when
+        // hidden. The timer below guarantees this seek resolves regardless, so this fallback
+        // path degrades gracefully rather than hanging outright — but see createFrameSource
+        // below for the actually-reliable fix used when the browser supports it.
+        fallbackTimer = setTimeout(finish, 300);
+
+        if (video.requestVideoFrameCallback) {
+          video.requestVideoFrameCallback(finish);
+        } else {
+          requestAnimationFrame(() => requestAnimationFrame(finish));
+        }
+      }
+
+      video.addEventListener("seeked", onSeeked);
+      try {
+       
+        video.currentTime = time;
+      } catch (e) {
+        video.removeEventListener("seeked", onSeeked);
+        resolve();
+      }
+    });
+  }
+
+  // Whether video.captureStream() + MediaStreamTrackProcessor are available — see
+  // createFrameSource below for why this matters. Chrome/Edge only as of when this was
+  // written; Firefox/Safari fall back to the plain seekTo()-based path.
+  const SUPPORTS_STREAM_CAPTURE =
+    typeof MediaStreamTrackProcessor !== "undefined" && typeof HTMLVideoElement !== "undefined" &&
+    typeof HTMLVideoElement.prototype.captureStream === "function";
+
+  // Every sampling function below (scanUniform, scanAdaptive, classifyRunsWithDedup,
+  // confirmWithNudeNet, sampleAtTimes) takes a `frameSource` instead of a raw <video> —
+  // `frameSource.getBitmap(time, mode, size)` resolves straight to a ready-to-classify
+  // ImageBitmap (`mode`: "stretch" for NSFWJS's plain resize, "letterbox" for NudeNet's
+  // aspect-preserving black-padded crop; `size`: output width/height in px).
+  //
+  // Why this exists: the original approach (seekTo, above) waits on
+  // requestAnimationFrame/requestVideoFrameCallback to confirm a seeked frame is actually
+  // decoded before reading it — both are tied to the render/compositor pipeline, which gets
+  // throttled or paused when the tab is backgrounded, freezing the scan (reproduced
+  // directly). video.captureStream() + MediaStreamTrackProcessor instead pulls decoded
+  // VideoFrames through a ReadableStream driven by the *media* pipeline, which browsers
+  // deliberately keep running in the background (the same reason a video call or screen
+  // recording doesn't freeze when you switch tabs) — confirmed directly: capturing this way
+  // produces identical, correct frames whether requestAnimationFrame/
+  // requestVideoFrameCallback fire normally or are both forced to never fire at all (i.e.
+  // exactly what background-tab throttling does to them).
+  //
+  // The readable stream itself is handed off (as a Transferable, via postMessage) to a
+  // dedicated frame-reader-worker.js — it does the frame-matching *and* the canvas
+  // draw/resize entirely off the main thread, so the actual per-frame CPU cost (today's
+  // biggest main-thread cost during a scan) no longer competes with page/UI rendering
+  // either, on top of not being blocked by tab visibility. Only the seek itself
+  // (video.currentTime = time) has to happen here, since only the main thread has the
+  // <video> element at all.
+  function createStreamFrameSource(video) {
+    const stream = video.captureStream();
+    const track = stream.getVideoTracks()[0];
+    const processor = new MediaStreamTrackProcessor({ track });
+    const readable = processor.readable;
+
+    const worker = new Worker(FRAME_READER_WORKER_URL);
+    let readerMsgId = 0;
+    const pending = new Map();
+    worker.addEventListener("message", (e) => {
+      const { id, ok, bitmap, error } = e.data;
+      const p = pending.get(id);
+      if (!p) return;
+      pending.delete(id);
+      if (ok) p.resolve(bitmap);
+      else p.reject(new Error(error || "Frame reader worker failed."));
+    });
+    worker.addEventListener("error", (e) => {
+      // Reject every still-pending request rather than leaving callers hanging forever if
+      // the worker itself crashes (e.g. OffscreenCanvas unsupported in some edge case).
+      const err = new Error(e.message || "Frame reader worker crashed.");
+      for (const [id, p] of pending) { p.reject(err); }
+      pending.clear();
+    });
+    // Message order is preserved within one worker, so every "getFrame" sent after this is
+    // guaranteed to be handled after the reader is set up — no separate ready-handshake
+    // needed.
+    worker.postMessage({ type: "init", readable }, [readable]);
+
+    return {
+      getBitmap(time, mode, size) {
+        try {
+          video.currentTime = time;
+        } catch (e) { /* ignore */ }
+        return new Promise((resolve, reject) => {
+          const id = ++readerMsgId;
+          pending.set(id, { resolve, reject });
+          worker.postMessage({ type: "getFrame", id, time, mode, size });
+        });
+      },
+      destroy() {
+        try { worker.terminate(); } catch (e) { /* ignore */ }
+        try { track.stop(); } catch (e) { /* ignore */ }
+      },
+    };
+  }
+
+  // Fallback for browsers without MediaStreamTrackProcessor support — the original
+  // seek-and-draw-directly-from-the-video-element approach, all on the main thread. Still
+  // correct in the foreground; still vulnerable to the background-tab stall the stream-based
+  // source exists to avoid.
+  function createSeekFrameSource(video) {
+    const canvas = document.createElement("canvas");
+    canvas.width = IMAGE_SIZE;
+    canvas.height = IMAGE_SIZE;
+    const ctx = canvas.getContext("2d");
+    const nudenetCanvas = document.createElement("canvas");
+    nudenetCanvas.width = NUDENET_INPUT_SIZE;
+    nudenetCanvas.height = NUDENET_INPUT_SIZE;
+    const nudenetCtx = nudenetCanvas.getContext("2d");
+
+    return {
+      async getBitmap(time, mode, size) {
+        await seekTo(video, time);
+        if (mode === "letterbox") return grabLetterboxBitmap(video, nudenetCanvas, nudenetCtx, size);
+        return grabBitmap(video, canvas, ctx);
+      },
+      destroy() {},
+    };
+  }
+
+  function createFrameSource(video) {
+    if (SUPPORTS_STREAM_CAPTURE) {
+      try {
+        return createStreamFrameSource(video);
+      } catch (e) {
+        console.warn("Stream-based frame capture failed to initialize, falling back to seek-based capture.", e);
+      }
+    }
+    return createSeekFrameSource(video);
+  }
+
+  // Seeks to each of `times` (ascending), captures a bitmap via `captureFn(frameSource,
+  // time)`, and classifies it via `classifyFn(pool, bitmap)` — pipelined: seeking the next
+  // frame doesn't wait for the previous frame's classification to finish, up to a small
+  // bounded number of in-flight calls across the worker pool at once. Returns
+  // `{time, ...classifyFn's result}` samples sorted by time (completion order isn't
+  // guaranteed).
+  async function sampleAtTimes(frameSource, times, pool, captureFn, classifyFn, opts = {}) {
+    const { token, onSampleDone } = opts;
+    const results = [];
+    const inFlight = [];
+    const maxInFlight = pool.length * 2;
+
+    for (const time of times) {
+      if (token && token.cancelled) break;
+      const bitmap = await captureFn(frameSource, time);
+      if (!bitmap) continue; // no frame arrived for this time (see frame-reader-worker.js) — skip it
+      const p = classifyFn(pool, bitmap).then((data) => {
+        const sample = Object.assign({ time }, data);
+        results.push(sample);
+        if (onSampleDone) onSampleDone(sample);
+      });
+      inFlight.push(p);
+      if (inFlight.length >= maxInFlight) {
+        await inFlight.shift();
+      }
+    }
+    await Promise.all(inFlight);
+    results.sort((a, b) => a.time - b.time);
+    return results;
+  }
+
+  function buildUniformTimes(duration, interval) {
+    const times = [];
+    for (let t = 0; t < duration; t += interval) times.push(t);
+    const tail = Math.max(0, duration - Math.min(0.1, interval / 4));
+    if (!times.length || times[times.length - 1] < tail) times.push(tail);
+    return times;
+  }
+
+  function clamp(v, lo, hi) {
+    return Math.max(lo, Math.min(hi, v));
+  }
+
+  // Shared with app.js (via VMScanner.computeCoarseInterval) so the settings UI can show the
+  // real coarse-pass gap without duplicating — and risking drifting from — this formula.
+  //
+  // The lower bound (2x fineInterval) is itself clamped to at most the 5s cap: without that,
+  // a fineInterval above 2.5s would make the "floor" exceed the "ceiling" (e.g. fineInterval=3
+  // gives a naive floor of 6, above the 5 cap), and clamp()'s Math.max(lo, ...) would return
+  // that floor uncapped — silently breaking the documented "capped at 5s" behavior.
+  function computeCoarseInterval(fineInterval) {
+    return clamp(fineInterval * 5, Math.min(Math.max(fineInterval * 2, 0.3), 5), 5);
+  }
+
+  function mergeWindows(windows) {
+    if (!windows.length) return [];
+    const sorted = windows.slice().sort((a, b) => a.start - b.start);
+    const out = [Object.assign({}, sorted[0])];
+    for (let i = 1; i < sorted.length; i++) {
+      const last = out[out.length - 1];
+      if (sorted[i].start <= last.end) last.end = Math.max(last.end, sorted[i].end);
+      else out.push(Object.assign({}, sorted[i]));
+    }
+    return out;
+  }
+
+  // Plain, uniform-interval scan — the "fully thorough" option. `classifyFn` is whichever
+  // classifier (NSFWJS or NudeNet) is acting as the primary/only detector for this scan.
+  // `captureFn(frameSource, time)` grabs and returns a Promise<ImageBitmap> for the frame at
+  // `time` — callers pick which one (square-stretch for NSFWJS, letterboxed for NudeNet;
+  // see where scanVideoFile constructs each).
+  async function scanUniform(frameSource, captureFn, duration, interval, pool, classifyFn, opts) {
+    const times = buildUniformTimes(duration, interval);
+    let done = 0;
+    return sampleAtTimes(frameSource, times, pool, captureFn, classifyFn, {
+      token: opts.token,
+      onSampleDone: () => {
+        done++;
+        if (opts.onProgress) opts.onProgress(Math.min(100, (done / times.length) * 100));
+      },
+    });
+  }
+
+  // Plain stretch-to-fill capture — used for NSFWJS's 224x224 square crop, where mild
+  // aspect distortion has always been an accepted simplification. Only used by
+  // createSeekFrameSource's fallback path now — the stream-based path does the equivalent
+  // work inside frame-reader-worker.js instead, off the main thread.
+  function grabBitmap(video, canvas, ctx) {
+    const width = canvas.width;
+    const height = canvas.height;
+    ctx.drawImage(video, 0, 0, width, height);
+    return createImageBitmap(canvas, { resizeWidth: width, resizeHeight: height });
+  }
+
+  // Aspect-preserving "letterbox" capture: fits the frame within `size`x`size`, centers
+  // it, and pads the rest with black — exactly how sd-extension-nudenet's Python reference
+  // (read_image()) prepares input for this model, which matters here because unlike
+  // NSFWJS's crop, stretching would distort the proportions this model was trained on.
+  // Shared by grabLetterboxBitmap (below, the forward direction: real video frame -> square
+  // letterboxed model input) and letterboxBoxToVideoFraction (the reverse, used to turn a
+  // detection box back into a snapshot crop rect) — both need the exact same
+  // scale/pad numbers for a given video size, so this is the one place that computes them.
+  function letterboxGeometry(vw, vh, size) {
+    const aspect = vw / vh;
+    let newW, newH;
+    if (vh > vw) {
+      newH = size;
+      newW = Math.round(size * aspect);
+    } else {
+      newW = size;
+      newH = Math.round(size / aspect);
+    }
+    const padLeft = Math.floor((size - newW) / 2);
+    const padTop = Math.floor((size - newH) / 2);
+    return { newW, newH, padLeft, padTop };
+  }
+
+  // Only used by createSeekFrameSource's fallback path now — see grabBitmap's comment above.
+  function grabLetterboxBitmap(video, canvas, ctx, size) {
+    const vw = video.videoWidth || 1;
+    const vh = video.videoHeight || 1;
+    const { newW, newH, padLeft, padTop } = letterboxGeometry(vw, vh, size);
+    ctx.fillStyle = "black";
+    ctx.fillRect(0, 0, size, size);
+    ctx.drawImage(video, 0, 0, vw, vh, padLeft, padTop, newW, newH);
+    return createImageBitmap(canvas, { resizeWidth: size, resizeHeight: size });
+  }
+
+  // Maps a NudeNet detection box ([cx, cy, w, h], in the NUDENET_INPUT_SIZE-square
+  // letterboxed pixel space nudenet-worker.js's model output is in) back to a fractional
+  // {x, y, w, h} rectangle (0..1, relative to the ORIGINAL video frame) — the inverse of
+  // grabLetterboxBitmap's own mapping. Used by app.js to know what region of the actual
+  // video frame to crop for a segment's snapshot thumbnail, once the real video dimensions
+  // are known (they aren't at scan time inside the worker, only here on the main thread).
+  function letterboxBoxToVideoFraction(box, videoWidth, videoHeight) {
+    const vw = videoWidth || 1;
+    const vh = videoHeight || 1;
+    if (!box) return null;
+    const { newW, newH, padLeft, padTop } = letterboxGeometry(vw, vh, NUDENET_INPUT_SIZE);
+    const scaleX = newW / vw;
+    const scaleY = newH / vh;
+    const [cx, cy, w, h] = box;
+    const x1 = (cx - w / 2 - padLeft) / scaleX;
+    const y1 = (cy - h / 2 - padTop) / scaleY;
+    const x2 = (cx + w / 2 - padLeft) / scaleX;
+    const y2 = (cy + h / 2 - padTop) / scaleY;
+    const clamp01 = (v) => Math.max(0, Math.min(1, v));
+    const fx1 = clamp01(x1 / vw);
+    const fy1 = clamp01(y1 / vh);
+    const fx2 = clamp01(x2 / vw);
+    const fy2 = clamp01(y2 / vh);
+    if (fx2 <= fx1 || fy2 <= fy1) return null;
+    return { x: fx1, y: fy1, w: fx2 - fx1, h: fy2 - fy1 };
+  }
+
+  // Two-pass adaptive scan: a fast coarse pass across the whole video first, then a
+  // fine-interval refine pass ONLY in the neighborhood of anything the coarse pass found
+  // close to the sensitivity threshold. Cuts total classify() calls dramatically on
+  // typical videos (most of a video is "safe") while keeping fine-interval precision at
+  // detected scene boundaries. Trade-off: a scene shorter than the coarse interval that
+  // falls entirely between two "clean" coarse samples can still be missed — this is the
+  // same fundamental limit any interval-based scan has, just at the coarse interval's
+  // resolution instead of the fine one for the (hopefully rare) regions never flagged by
+  // pass 1. Keep the coarse interval modest (a few seconds) to keep that risk low.
+  //
+  // `classifyFn` is whichever classifier is acting as the primary detector (NSFWJS or
+  // NudeNet). `opts.dedupFinePass: true` additionally collapses consecutive fine-interval
+  // candidates within one refine window into a handful of representatives (see
+  // classifyRunsWithDedup) — worth it when `classifyFn` itself is expensive per call
+  // (NudeNet), not worth the added imprecision when it's cheap (NSFWJS).
+  async function scanAdaptive(frameSource, captureFn, duration, fineInterval, pool, classifyFn, opts) {
+    const sensitivity = typeof opts.sensitivity === "number" ? opts.sensitivity : 0.6;
+    // Coarse pass runs at ~5x the fine interval, but never below 2x it (so "coarse" stays
+    // meaningfully coarser than "fine" — the whole point of doing two passes) or below an
+    // absolute 0.3s floor (avoids a degenerate near-zero coarse pass). Deliberately does
+    // NOT have a fixed high floor like 1.5s: a user setting a very small "scan interval"
+    // (e.g. 0.1s) is explicitly asking for finer precision, and a hard floor would silently
+    // override that for most of the video (only "refine windows" ever reach the fine
+    // interval; everywhere else stays at the coarse one) — previously reproduced exactly
+    // this way: 0.1s fine interval produced a 1.5s coarse pass regardless.
+    const coarseInterval = computeCoarseInterval(fineInterval);
+
+    if (opts.onStatus) opts.onStatus(VMI18n.t("scan.statusCoarsePass"));
+    const coarseTimes = buildUniformTimes(duration, coarseInterval);
+    let coarseDone = 0;
+    const coarseSamples = await sampleAtTimes(frameSource, coarseTimes, pool, captureFn, classifyFn, {
+      token: opts.token,
+      onSampleDone: () => {
+        coarseDone++;
+        if (opts.onProgress) opts.onProgress(Math.min(50, (coarseDone / coarseTimes.length) * 50));
+      },
+    });
+
+    if (opts.token && opts.token.cancelled) return coarseSamples;
+
+    // Anything even somewhat close to the threshold gets its neighborhood re-scanned at
+    // full precision — a margin below `sensitivity`, not just an exact crossing, so we
+    // don't miss a scene whose peak the coarse pass just barely undersampled.
+    const margin = 0.2;
+    const windows = [];
+    const triggerTimes = [];
+    for (const s of coarseSamples) {
+      // s.probability > 0 is required alongside the threshold check, not just the threshold
+      // alone: Math.max(0, sensitivity - margin) clamps to exactly 0 whenever margin >=
+      // sensitivity (e.g. sensitivity 0.09, margin 0.2 -> 0), and probability itself is never
+      // negative (matched ? maxScore : 0) — so probability >= 0 alone is trivially true for
+      // EVERY sample, including ones where nothing was detected at all, forcing a refine
+      // window around literally every coarse sample. Margin exists to catch a real, weak
+      // detection that might be an undersampled near-miss of a higher peak nearby — a flat 0
+      // (no box, no match) isn't a near-miss, it's "found nothing here," and shouldn't be
+      // treated the same as crossing the threshold just because both are >= 0.
+      if (s.probability > 0 && s.probability >= Math.max(0, sensitivity - margin)) {
+        windows.push({
+          start: Math.max(0, s.time - coarseInterval),
+          end: Math.min(duration, s.time + coarseInterval),
+        });
+        triggerTimes.push(s.time);
+      }
+    }
+    const merged = mergeWindows(windows);
+
+    if (!merged.length) {
+      if (opts.onProgress) opts.onProgress(100);
+      return coarseSamples;
+    }
+
+    if (opts.onStatus) opts.onStatus(VMI18n.t("scan.statusRefining", { count: merged.length }));
+    const fineTimesSet = new Set();
+    for (const w of merged) {
+      for (let t = w.start; t <= w.end; t += fineInterval) fineTimesSet.add(+t.toFixed(3));
+    }
+    const fineTimes = Array.from(fineTimesSet).sort((a, b) => a - b);
+
+    let fineSamples;
+    if (opts.dedupFinePass) {
+      const runs = groupConsecutiveRuns(fineTimes.map((t) => ({ time: t })), fineInterval * 3);
+      // Each run corresponds to one merged window (runs are built from the same fine times,
+      // grouped by continuity — since merged windows are non-overlapping with gaps between
+      // them, this lines up 1:1). Attach that window's original coarse trigger times so
+      // classifyRunsWithDedup can force a representative near each real detection instead of
+      // only picking evenly-spaced ones that can miss short, closely-spaced scenes — see
+      // pickRepresentatives.
+      const forcedTimesPerRun = runs.map((run) => {
+        const runStart = run[0].time;
+        const runEnd = run[run.length - 1].time;
+        return triggerTimes.filter((t) => t >= runStart - fineInterval && t <= runEnd + fineInterval);
+      });
+      fineSamples = await classifyRunsWithDedup(frameSource, captureFn, pool, classifyFn, runs, {
+        token: opts.token,
+        forcedTimesPerRun,
+        onProgress: (p) => { if (opts.onProgress) opts.onProgress(50 + Math.min(50, p * 0.5)); },
+      });
+    } else {
+      let fineDone = 0;
+      fineSamples = await sampleAtTimes(frameSource, fineTimes, pool, captureFn, classifyFn, {
+        token: opts.token,
+        onSampleDone: () => {
+          fineDone++;
+          if (opts.onProgress) opts.onProgress(50 + Math.min(50, (fineDone / fineTimes.length) * 50));
+        },
+      });
+    }
+
+    // Prefer the fine samples inside refined windows; keep coarse samples elsewhere.
+    const insideWindows = (t) => merged.some((w) => t >= w.start - 1e-6 && t <= w.end + 1e-6);
+    const keptCoarse = coarseSamples.filter((s) => !insideWindows(s.time));
+    const combined = keptCoarse.concat(fineSamples).sort((a, b) => a.time - b.time);
+    if (opts.onProgress) opts.onProgress(100);
+    return combined;
+  }
+
+  // NudeNet's cost is essentially FIXED per call (verified: dropping input resolution from
+  // 640px to 256px changed its time by ~10%; running 2 workers concurrently instead of 1
+  // took the same total wall time as running them sequentially — this model's per-call cost
+  // doesn't scale down with less work, at least under software-rendered WebGL). That means
+  // the only lever that actually helps is calling it fewer times. A long real scene can
+  // produce dozens of consecutive NSFWJS candidates in a row that are all clearly "the same
+  // moment" — confirming every single one is pure waste. So: group temporally-adjacent
+  // candidates into runs, confirm only a handful of evenly-spaced representatives per run,
+  // and propagate each unconfirmed sample's result from its nearest confirmed neighbor.
+  // Trade-off: if a run's content genuinely changes partway through (someone gets dressed
+  // mid-scene) and none of the representatives happen to land on that transition, the
+  // propagated boundary is only as precise as the representative spacing — same flavor of
+  // trade-off as the adaptive scan's coarse pass, just one level deeper.
+  const MAX_CONFIRMS_PER_RUN = 3;
+
+  function groupConsecutiveRuns(candidates, maxGapSeconds) {
+    const runs = [];
+    let current = [];
+    for (const c of candidates) {
+      if (current.length && c.time - current[current.length - 1].time > maxGapSeconds) {
+        runs.push(current);
+        current = [];
+      }
+      current.push(c);
+    }
+    if (current.length) runs.push(current);
+    return runs;
+  }
+
+  // `forcedTimes` (optional): timestamps that MUST end up represented, each snapped to its
+  // nearest sample in `run` — see scanAdaptive's window-merging comment for why. Without
+  // this, a run built by merging multiple originally-separate coarse-detected windows (e.g.
+  // two short, distinct scenes close enough together that their refine windows touch) would
+  // only get `maxPerRun` *evenly-spaced* representatives regardless of how many real
+  // detections got merged into it — which can land every single representative in the clean
+  // gap between the real scenes and propagate a false "nothing here" across the whole run.
+  // Forcing each original trigger point to have a nearby classified sample fixes that while
+  // keeping the cost bounded by the number of genuine coarse detections, not the run's length.
+  function pickRepresentatives(run, maxPerRun, forcedTimes) {
+    const picks = new Map();
+    if (forcedTimes && forcedTimes.length) {
+      for (const ft of forcedTimes) {
+        let nearest = run[0];
+        let nearestDist = Math.abs(run[0].time - ft);
+        for (const s of run) {
+          const d = Math.abs(s.time - ft);
+          if (d < nearestDist) {
+            nearestDist = d;
+            nearest = s;
+          }
+        }
+        picks.set(nearest.time, nearest);
+      }
+    }
+    if (run.length <= maxPerRun) {
+      for (const s of run) picks.set(s.time, s);
+      return Array.from(picks.values());
+    }
+    for (let i = 0; i < maxPerRun; i++) {
+      const idx = maxPerRun === 1 ? 0 : Math.round((i * (run.length - 1)) / (maxPerRun - 1));
+      picks.set(run[idx].time, run[idx]);
+    }
+    return Array.from(picks.values());
+  }
+
+  // Classifies only a representative subset of each run (via `classifyFn`, an expensive
+  // per-call classifier like NudeNet) and propagates each unclassified sample's probability
+  // from its nearest classified neighbor within the same run. Returns one {time, probability}
+  // per input sample, covering every run exactly once. Shared by the NSFWJS→NudeNet
+  // confirmation pass and the NudeNet-only adaptive scan's fine pass — see MAX_CONFIRMS_PER_RUN
+  // comment above for why this trade-off exists.
+  //
+  // `opts.exact: true` classifies every sample individually instead (no representative
+  // picking, no propagation) — for when you need the real per-sample scene-boundary time
+  // rather than one approximated to the representative spacing.
+  async function classifyRunsWithDedup(frameSource, captureFn, pool, classifyFn, runs, opts) {
+    const forcedTimesPerRun = opts.forcedTimesPerRun;
+    const toClassify = opts.exact
+      ? runs.flat()
+      : runs.flatMap((run, i) => pickRepresentatives(run, MAX_CONFIRMS_PER_RUN, forcedTimesPerRun && forcedTimesPerRun[i]));
+    const times = toClassify.map((c) => c.time);
+    let done = 0;
+    const classified = await sampleAtTimes(frameSource, times, pool, captureFn, classifyFn, {
+      token: opts.token,
+      onSampleDone: () => {
+        done++;
+        if (opts.onProgress) opts.onProgress(Math.min(100, (done / times.length) * 100));
+      },
+    });
+    const classifiedByTime = new Map(classified.map((c) => [c.time, { probability: c.probability, label: c.label, classScores: c.classScores, classBoxes: c.classBoxes }]));
+
+    const result = [];
+    for (const run of runs) {
+      const knownTimesInRun = run.map((s) => s.time).filter((t) => classifiedByTime.has(t));
+      for (const s of run) {
+        let entry = classifiedByTime.get(s.time);
+        if (entry === undefined) {
+          let nearestTime = null;
+          let nearestDist = Infinity;
+          for (const t of knownTimesInRun) {
+            const d = Math.abs(t - s.time);
+            if (d < nearestDist) {
+              nearestDist = d;
+              nearestTime = t;
+            }
+          }
+          entry = nearestTime !== null ? classifiedByTime.get(nearestTime) : { probability: 0, label: undefined, classScores: undefined, classBoxes: undefined };
+        }
+        result.push({ time: s.time, probability: entry.probability, label: entry.label, classScores: entry.classScores, classBoxes: entry.classBoxes });
+      }
+    }
+    return result;
+  }
+
+  // Re-checks a representative subset of samples whose NSFWJS score is at least
+  // PREFILTER_FLOOR against NudeNet's actual body-part detections, and replaces every
+  // candidate's probability with the confirmed verdict of its nearest confirmed neighbor
+  // in the same run (0 if NudeNet found nothing in the confirm-worthy classes, its max
+  // confidence among them otherwise). Samples below the floor are left as-is. See
+  // js/nudenet-worker.js for exactly which classes count.
+  async function confirmWithNudeNet(frameSource, captureFn, samples, interval, opts) {
+    const candidates = samples.filter((s) => s.probability >= PREFILTER_FLOOR);
+    if (!candidates.length) {
+      if (opts.onProgress) opts.onProgress(100);
+      return samples;
+    }
+
+    const runs = groupConsecutiveRuns(candidates, interval * 3);
+    const toConfirmCount = opts.exact
+      ? candidates.length
+      : runs.reduce((sum, run) => sum + Math.min(run.length, MAX_CONFIRMS_PER_RUN), 0);
+
+    if (opts.onStatus) {
+      const skipped = candidates.length - toConfirmCount;
+      const suffix = skipped > 0
+        ? VMI18n.t("scan.confirmingSkippedSuffix", { count: skipped })
+        : VMI18n.t("scan.confirmingNoSkippedSuffix");
+      opts.onStatus(VMI18n.t("scan.statusConfirming", { count: toConfirmCount, suffix }));
+    }
+    const pool = await getWorkerPool("nudenet", opts.onStatus, "confirmation");
+    const verdicts = await classifyRunsWithDedup(frameSource, captureFn, pool, classifyNudeNetAsProbability, runs, opts);
+    const verdictByTime = new Map(verdicts.map((v) => [v.time, { probability: v.probability, label: v.label, classScores: v.classScores, classBoxes: v.classBoxes }]));
+
+    const result = samples.map((s) => {
+      const v = verdictByTime.get(s.time);
+      if (!v) return s;
+      // NudeNet's own class label/scores/boxes (specific body part, e.g.
+      // "female-breast-bare") replace whatever the NSFWJS primary pass had for this sample
+      // — it's the more precise verdict, being what actually decided this sample's
+      // confirmed probability.
+      return { time: s.time, probability: v.probability, label: v.label, classScores: v.classScores, classBoxes: v.classBoxes };
+    });
+    if (opts.onProgress) opts.onProgress(100);
+    return result;
+  }
+
+  // Module-level singleton, same reasoning as the `pools` map above (avoid re-paying
+  // worker-startup + ~12MB model-load cost on every scan/rescan) — but this one is driven
+  // directly by scan-coordinator-worker.js over a dedicated port instead of through
+  // getWorkerPool's round-robin dispatch, so it's tracked separately.
+  let coordinatedNudenetWorker = null;
+  let coordinatedNudenetReady = null;
+
+  function getCoordinatedNudenetWorker(onStatus) {
+    if (!coordinatedNudenetWorker) {
+      coordinatedNudenetWorker = new Worker(WORKER_URLS.nudenet);
+      if (onStatus) onStatus(VMI18n.t("scan.statusStartingWorkers", { count: 1, role: VMI18n.t("scan.workerRole.detector") }));
+      coordinatedNudenetReady = new Promise((resolve, reject) => {
+        const timer = setTimeout(() => reject(new Error("Timed out waiting for the nudenet worker to start.")), 90000);
+        function onMessage(e) {
+          if (!e.data || !e.data.ready) return;
+          clearTimeout(timer);
+          coordinatedNudenetWorker.removeEventListener("message", onMessage);
+          if (e.data.error) reject(new Error(e.data.error));
+          else resolve();
+        }
+        coordinatedNudenetWorker.addEventListener("message", onMessage);
+        coordinatedNudenetWorker.addEventListener(
+          "error",
+          (e) => {
+            clearTimeout(timer);
+            reject(new Error(e.message || "nudenet worker failed to start."));
+          },
+          { once: true }
+        );
+      }).catch((e) => {
+        // Don't leave a permanently-broken worker cached — same reasoning as
+        // getWorkerPool's own catch.
+        try { coordinatedNudenetWorker.terminate(); } catch (e2) { /* ignore */ }
+        coordinatedNudenetWorker = null;
+        throw e;
+      });
+    }
+    return coordinatedNudenetReady.then(() => coordinatedNudenetWorker);
+  }
+
+  // Frame acquisition strategy for the coordinator-worker NudeNet scan path — see
+  // runCoordinatedNudeNetScan below. "stream" reads decoded VideoFrames straight off
+  // video.captureStream() + MediaStreamTrackProcessor inside nudenet-worker.js, immune to
+  // rAF/requestVideoFrameCallback-style background throttling — but measured NOT to be
+  // random access: seeking `video.currentTime` doesn't jump the stream, it has to decode
+  // through (and getFrameAt has to discard) every intermediate frame between old and new
+  // position, at roughly real-time decode rate (confirmed: draining ~30 frames / ~0.48s to
+  // cover a 0.5s seek). That makes adaptive scanning's coarse pass (5x larger seeks) pay
+  // proportionally more decode time per sample, wiping out its whole point. "seek" instead
+  // uses the original video.currentTime + "seeked" event + canvas grab (seekTo(), above) —
+  // true fast seeking (browsers jump near a keyframe and decode forward only a little, not
+  // from wherever <video> last was) — relayed through the coordinator worker so the scan
+  // loop itself still isn't main-thread-throttled; only the actual seek+grab runs here.
+  // "mediabunny" skips the <video> element entirely: nudenet-worker opens the source File
+  // directly (mediabunny's Input + BlobSource, demuxing off the main thread) and pulls
+  // frames by timestamp via a VideoSampleSink, whose getSample(time) is documented random
+  // access (last sample at/before the requested time) rather than a decode-through-everything
+  // stream read — so unlike "stream" mode, no main-thread seek round trip is needed at all,
+  // and unlike "seek" mode, nothing depends on the "seeked" event/rVFC firing. Change this to
+  // compare all three.
+  const NUDENET_COORDINATED_FRAME_MODE = "mediabunny"; // "seek" | "stream" | "mediabunny"
+
+  // Runs a NudeNet-primary scan (adaptive or uniform) via scan-coordinator-worker.js talking
+  // directly to the (reused) nudenet worker over a private MessagePort — see that file's own
+  // comment for why this exists instead of the frameSource-based path below: neither the
+  // scan loop's pacing (lives entirely in the coordinator worker) nor frame acquisition
+  // (lives entirely in the nudenet worker, in "stream" mode — see NUDENET_COORDINATED_FRAME_MODE
+  // above for "seek" mode's tradeoff) depend on anything the main thread does, so a
+  // backgrounded tab can't deprioritize either. The main thread's only remaining role is
+  // applying seek commands (only it has the <video> element) and relaying progress/status to
+  // the DOM. Only used when SUPPORTS_STREAM_CAPTURE — see scanVideoFile.
+  async function runCoordinatedNudeNetScan(video, opts) {
+    const { duration, interval, adaptive, sensitivity, dedupFinePass, onProgress, onStatus, token, file } = opts;
+    const mode = NUDENET_COORDINATED_FRAME_MODE;
+
+    const nudenetWorker = await getCoordinatedNudenetWorker(onStatus);
+
+    let track = null;
+    let nudenetCanvas = null;
+    let nudenetCtx = null;
+    if (mode === "stream") {
+      const stream = video.captureStream();
+      track = stream.getVideoTracks()[0];
+      const processor = new MediaStreamTrackProcessor({ track });
+      const readable = processor.readable;
+      nudenetWorker.postMessage({ type: "initStream", readable }, [readable]);
+    } else if (mode === "seek") {
+      nudenetCanvas = document.createElement("canvas");
+      nudenetCanvas.width = NUDENET_INPUT_SIZE;
+      nudenetCanvas.height = NUDENET_INPUT_SIZE;
+      nudenetCtx = nudenetCanvas.getContext("2d");
+    } else {
+      // "mediabunny" — no <video>/canvas involvement at all; the worker decodes straight
+      // from the source File. A File is structured-cloneable (postMessage copies only a
+      // lightweight handle, not the bytes), so no transfer list is needed here.
+      nudenetWorker.postMessage({ type: "initMediabunny", file });
+    }
+
+    const coordinator = new Worker(SCAN_COORDINATOR_WORKER_URL);
+    const channel = new MessageChannel();
+    nudenetWorker.postMessage({ type: "initCoordinatorPort", port: channel.port1 }, [channel.port1]);
+    coordinator.postMessage({ type: "nudenetPort", port: channel.port2 }, [channel.port2]);
+
+    return new Promise((resolve, reject) => {
+      let settled = false;
+      function cleanup() {
+        if (token) token.onCancel = null;
+        try { coordinator.terminate(); } catch (e) { /* ignore */ }
+        if (track) { try { track.stop(); } catch (e) { /* ignore */ } }
+      }
+      function finish(fn) {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        fn();
+      }
+
+      coordinator.addEventListener("error", (e) => {
+        finish(() => reject(new Error(e.message || "Scan coordinator worker failed.")));
+      });
+
+      coordinator.onmessage = (e) => {
+        const msg = e.data;
+        if (msg.type === "seek") {
+          if (mode === "seek") {
+            (async () => {
+              try {
+                await seekTo(video, msg.time);
+                const bitmap = await grabLetterboxBitmap(video, nudenetCanvas, nudenetCtx, NUDENET_INPUT_SIZE);
+                coordinator.postMessage({ type: "frameReady", id: msg.id, bitmap }, [bitmap]);
+              } catch (err) {
+                coordinator.postMessage({ type: "frameReady", id: msg.id, bitmap: null });
+              }
+            })();
+          } else {
+            try {
+                video.currentTime = msg.time;
+            } catch (err) { /* ignore */ }
+          }
+        } else if (msg.type === "progress") {
+          if (onProgress) onProgress(msg.pct, { elapsedMs: msg.elapsedMs, avgFrameMs: msg.avgFrameMs, sampleCount: msg.sampleCount });
+        } else if (msg.type === "status") {
+          if (onStatus) onStatus(VMI18n.t(msg.key, msg.params));
+        } else if (msg.type === "done") {
+          finish(() => resolve({
+            samples: msg.samples,
+            scanStats: { elapsedMs: msg.elapsedMs, avgFrameMs: msg.avgFrameMs, sampleCount: msg.sampleCount },
+          }));
+        } else if (msg.type === "cancelled") {
+          finish(() => {
+            const err = new Error("cancelled");
+            err.cancelled = true;
+            reject(err);
+          });
+        } else if (msg.type === "error") {
+          finish(() => reject(new Error(msg.message)));
+        }
+      };
+
+      if (token) {
+        token.onCancel = () => coordinator.postMessage({ type: "cancel" });
+        if (token.cancelled) token.onCancel();
+      }
+
+      coordinator.postMessage({ type: "start", duration, interval, adaptive, sensitivity, dedupFinePass, mode });
+    });
+  }
+
+  // Scans `file` by seeking a hidden <video> element across its duration and classifying
+  // a downscaled frame at each sample point (in a worker pool — see header comment).
+  //
+  // `sampleInterval` (seconds) pins the exact gap between sampled frames — smaller values
+  // catch scene boundaries more precisely at the cost of a slower scan. When omitted, an
+  // interval is derived from `sampleTarget` (an approximate total sample count) instead.
+  //
+  // `adaptive: true` runs the two-pass coarse-then-refine strategy described above
+  // instead of a single uniform pass at `sampleInterval`; `sensitivity` is required in
+  // that case to decide which regions get refined.
+  //
+  // `detectionMode` picks which classifier(s) decide "is this frame nudity":
+  //   - "nsfwjs" (default): NSFWJS only.
+  //   - "confirm": NSFWJS scans as above, then any frame it flags gets double-checked by
+  //     NudeNet (confirmWithNudeNet) — good balance of speed and the accuracy fix NudeNet
+  //     provides.
+  //   - "nudenet": skips NSFWJS entirely and runs NudeNet as the primary/only classifier
+  //     for every sampled frame. Most accurate (NSFWJS never gets a vote, so its bare-skin
+  //     false positives can't leak through even indirectly), but NudeNet's per-call cost is
+  //     roughly fixed regardless of input, so this is the slowest option — when combined
+  //     with `adaptive`, its fine pass also gets the run-deduplication treatment (see
+  //     classifyRunsWithDedup) to keep a single long scene from requiring one NudeNet call
+  //     per fine-interval sample, UNLESS `exactTiming` is set (see below).
+  //
+  // `exactTiming: true` disables that run-deduplication wherever NudeNet is involved
+  // ("confirm" mode's confirmation pass, and "nudenet" mode's adaptive fine pass) — every
+  // candidate/fine-interval sample gets individually classified instead of a handful of
+  // representatives with the rest propagated from the nearest one. Gives the real
+  // per-sample scene-start/end time rather than one approximated to representative spacing,
+  // at the cost of more NudeNet calls (still fast with the ONNX backend — see header).
+  // Irrelevant to plain "nsfwjs" mode, which never deduplicates its fine pass.
+  async function scanVideoFile(file, opts = {}) {
+    const { onProgress, onStatus, token, sampleTarget = 240, sampleInterval, adaptive, sensitivity, detectionMode = "nsfwjs", exactTiming } = opts;
+    const usesNudeNetPrimary = detectionMode === "nudenet";
+    const usesNudeNetConfirm = detectionMode === "confirm";
+    // The coordinated path (see runCoordinatedNudeNetScan) manages its own dedicated,
+    // reused nudenet worker directly — it never touches the pools/getWorkerPool
+    // round-robin dispatch, so fetching a pooled nudenet worker here too would just
+    // download the ~12MB model twice for nothing.
+    const useCoordinatedNudeNet = usesNudeNetPrimary && SUPPORTS_STREAM_CAPTURE;
+    const pool = useCoordinatedNudeNet
+      ? null
+      : usesNudeNetPrimary
+        ? await getWorkerPool("nudenet", onStatus, "detector")
+        : await getWorkerPool("nsfw", onStatus, "scan");
+    if (onStatus) onStatus(VMI18n.t("scan.statusPreparingVideo"));
+
+    const url = URL.createObjectURL(file);
+    const video = document.createElement("video");
+    video.muted = true;
+    video.playsInline = true;
+    video.preload = "auto";
+    video.src = url;
+    video.style.position = "fixed";
+    video.style.left = "-99999px";
+    video.style.top = "0";
+    video.style.width = "1px";
+    video.style.height = "1px";
+    document.body.appendChild(video);
+
+    let frameSource = null;
+
+    try {
+      await new Promise((resolve, reject) => {
+        video.addEventListener("loadedmetadata", resolve, { once: true });
+        video.addEventListener(
+          "error",
+          () => reject(video.error || new Error("Could not load the video file.")),
+          { once: true }
+        );
+      });
+
+      const duration = video.duration;
+      if (!isFinite(duration) || duration <= 0) {
+        throw new Error("Could not determine video duration.");
+      }
+
+      const interval = sampleInterval && isFinite(sampleInterval) && sampleInterval > 0
+        ? Math.max(0.1, sampleInterval)
+        : Math.min(3, Math.max(0.5, duration / sampleTarget));
+
+      // "stretch": plain resize, for NSFWJS's 224x224 crop (mild aspect distortion is an
+      // accepted simplification there). "letterbox": aspect-preserving + black-padded, for
+      // NudeNet — distorting the aspect ratio via plain stretch would depart from how that
+      // model was trained/preprocessed (see letterboxGeometry's comment).
+      const nsfwCaptureFn = (fs, time) => fs.getBitmap(time, "stretch", IMAGE_SIZE);
+      const nudenetCaptureFn = (fs, time) => fs.getBitmap(time, "letterbox", NUDENET_INPUT_SIZE);
+
+      const primaryProgress = usesNudeNetConfirm
+        ? (p) => { if (onProgress) onProgress(p * 0.8); }
+        : onProgress;
+
+      let samples;
+      let scanStats = null;
+      if (usesNudeNetPrimary) {
+        if (useCoordinatedNudeNet) {
+          // See runCoordinatedNudeNetScan's own comment for why this exists — the scan
+          // loop's pacing and frame acquisition both run off the main thread entirely, so
+          // neither can be deprioritized by a backgrounded tab. No frameSource/canvas setup
+          // needed here at all; that's all internal to the coordinator + nudenet worker.
+          const coordinated = await runCoordinatedNudeNetScan(video, {
+            duration, interval, adaptive, sensitivity, dedupFinePass: !exactTiming,
+            onProgress: primaryProgress, onStatus, token, file,
+          });
+          samples = coordinated.samples;
+          scanStats = coordinated.scanStats;
+        } else if (adaptive) {
+          // Fallback (no MediaStreamTrackProcessor support, e.g. Firefox/Safari) — the
+          // frameSource-based path; see createFrameSource's own comment.
+          frameSource = createFrameSource(video);
+          samples = await scanAdaptive(frameSource, nudenetCaptureFn, duration, interval, pool, classifyNudeNetAsProbability, {
+            token, onProgress: primaryProgress, onStatus, sensitivity, dedupFinePass: !exactTiming,
+          });
+        } else {
+          frameSource = createFrameSource(video);
+          if (onStatus) onStatus(VMI18n.t("scan.statusScanningFramesNudenet"));
+          samples = await scanUniform(frameSource, nudenetCaptureFn, duration, interval, pool, classifyNudeNetAsProbability, {
+            token, onProgress: primaryProgress,
+          });
+        }
+      } else {
+        // "nsfwjs"/"confirm" modes (not reachable through the UI currently, both hidden in
+        // favor of NudeNet-only — kept working in code) stay on the frameSource-based path:
+        // "confirm" mode needs both NSFWJS and NudeNet classifiers in the same scan, which
+        // doesn't fit the coordinator's one-dedicated-classifier-port design.
+        frameSource = createFrameSource(video);
+        if (adaptive) {
+          samples = await scanAdaptive(frameSource, nsfwCaptureFn, duration, interval, pool, classifyNSFW, { token, onProgress: primaryProgress, onStatus, sensitivity });
+        } else {
+          if (onStatus) onStatus(VMI18n.t("scan.statusScanningFrames"));
+          samples = await scanUniform(frameSource, nsfwCaptureFn, duration, interval, pool, classifyNSFW, { token, onProgress: primaryProgress });
+        }
+
+        if (!(token && token.cancelled) && usesNudeNetConfirm) {
+          const confirmProgress = (p) => { if (onProgress) onProgress(80 + p * 0.2); };
+          samples = await confirmWithNudeNet(frameSource, nudenetCaptureFn, samples, interval, { token, onProgress: confirmProgress, onStatus, exact: exactTiming });
+        }
+      }
+
+      if (token && token.cancelled) {
+        const err = new Error("cancelled");
+        err.cancelled = true;
+        throw err;
+      }
+      if (onProgress) onProgress(100);
+
+      return { samples, duration, interval, scanStats };
+    } finally {
+      if (frameSource) frameSource.destroy();
+      video.pause();
+      video.removeAttribute("src");
+      video.load();
+      video.remove();
+      URL.revokeObjectURL(url);
+    }
+  }
+
+  // Turns raw {time, probability} samples (sorted ascending by time) into merged
+  // [start, end] ranges wherever probability >= sensitivity. Each range's end uses the
+  // real gap to the next sample (capped, to avoid a huge tail if coverage has a hole),
+  // falling back to `fallbackInterval` for an open-ended run at the very end of the
+  // samples array — this also makes segment boundaries correct for adaptive scans, whose
+  // samples aren't evenly spaced. Each returned segment also carries `peakTime`/`box`/
+  // `label` from whichever sample inside it hit `maxProb` — the "moment that triggered the
+  // detection", used by app.js to crop a snapshot thumbnail for that segment. Callers that
+  // don't care (existing ones — blur playback just reads start/end) simply ignore the extra
+  // fields.
+  function mergeSegments(samples, sensitivity, fallbackInterval) {
+    if (!samples || !samples.length) return [];
+    const gapFallback = fallbackInterval || 1;
+    const segments = [];
+    let start = null;
+    let last = null;
+    let maxProb = 0;
+    let peakTime = null;
+    let peakBox;
+    let peakLabel;
+
+    for (let i = 0; i < samples.length; i++) {
+      const s = samples[i];
+      if (s.probability >= sensitivity) {
+        if (start === null || s.probability > maxProb) {
+          maxProb = s.probability;
+          peakTime = s.time;
+          peakBox = s.box;
+          peakLabel = s.label;
+        }
+        if (start === null) start = s.time;
+        last = s.time;
+      } else if (start !== null) {
+        const gap = clamp(s.time - last, gapFallback * 0.1, gapFallback * 4);
+        segments.push({ start, end: last + gap, probability: maxProb, peakTime, box: peakBox, label: peakLabel });
+        start = null;
+      }
+    }
+    if (start !== null) {
+      segments.push({ start, end: last + gapFallback, probability: maxProb, peakTime, box: peakBox, label: peakLabel });
+    }
+    return segments;
+  }
+
+  // Recomputes each sample's usable `probability` from its per-class NudeNet scores (see
+  // nudenet-worker.js's classScores) and a set of per-class thresholds — the max score
+  // among classes that individually clear their own threshold in `classThresholds`, or 0
+  // ("not detected") if none do. This is how the app's per-class sensitivity sliders (see
+  // app.js) turn into an actual filter: a sample only counts at all if at least one of its
+  // detected body parts scores at or above that part's own slider, and the reported
+  // probability for what counts is that part's own score (not some other, filtered-out
+  // part's higher score). Samples with no classScores (NSFWJS-only samples, or scans from
+  // before this feature existed) pass through with their original scalar probability
+  // unchanged — there's no body-part breakdown on them to filter by. Returns a new array of
+  // plain {time, probability, label, classScores} samples, meant to be fed straight into
+  // mergeSegments in place of the raw samples.
+  function applyClassThresholds(samples, classThresholds) {
+    if (!samples) return [];
+    return samples.map((s) => {
+      if (!s.classScores) return s;
+      let best = 0;
+      let bestBox;
+      for (const cls of CONFIRM_LABELS) {
+        const score = s.classScores[cls] || 0;
+        const threshold = (classThresholds && typeof classThresholds[cls] === "number") ? classThresholds[cls] : 0;
+        if (score >= threshold && score > best) {
+          best = score;
+          bestBox = s.classBoxes && s.classBoxes[cls];
+        }
+      }
+      // `box` (in nudenet-worker.js's letterboxed reference space) is whichever class
+      // actually decided this sample's probability — the specific detection a snapshot
+      // thumbnail should crop (see app.js's renderTimecodesSnapshotGrid).
+      return { time: s.time, probability: best, label: s.label, classScores: s.classScores, box: bestBox || undefined };
+    });
+  }
+
+  function formatTime(totalSeconds) {
+    const clamped = Math.max(0, totalSeconds || 0);
+    const ms = Math.round((clamped % 1) * 1000);
+    const totalWhole = Math.floor(clamped);
+    const h = Math.floor(totalWhole / 3600);
+    const m = Math.floor((totalWhole % 3600) / 60);
+    const s = totalWhole % 60;
+    const pad = (n, l = 2) => String(n).padStart(l, "0");
+    return `${pad(h)}:${pad(m)}:${pad(s)}.${pad(ms, 3)}`;
+  }
+
+  function segmentsToTxt(segments, fileName) {
+    const lines = [];
+    lines.push(`# Nudity scan results for: ${fileName}`);
+    lines.push(`# Generated: ${new Date().toString()}`);
+    lines.push(`# Format: N. start - end : probability : class`);
+    if (!segments.length) {
+      lines.push("# No nudity scenes detected.");
+    }
+    segments.forEach((seg, i) => {
+      const className = classDisplayName(seg.label);
+      const suffix = className ? ` : ${className}` : "";
+      lines.push(`${i + 1}. ${formatTime(seg.start)} - ${formatTime(seg.end)} : ${seg.probability.toFixed(3)}${suffix}`);
+    });
+    return lines.join("\n") + "\n";
+  }
+
+  global.VMScanner = {
+    scanVideoFile,
+    mergeSegments,
+    applyClassThresholds,
+    letterboxBoxToVideoFraction,
+    formatTime,
+    computeCoarseInterval,
+    segmentsToTxt,
+    createCancelToken,
+    getWorkerPool,
+    REPORT_FLOOR,
+    CONFIRM_LABELS,
+    CONFIRM_CLASSES,
+    classDisplayName,
+  };
+})(window);

@@ -1,0 +1,528 @@
+:root {
+  --bg: #101114;
+  --panel: #1b1d22;
+  --text: #eef0f3;
+  --dim: #9aa0ab;
+  --accent: #5b8def;
+  --accent-hover: #7aa2f2;
+  --danger: #e2574c;
+  --border: #2c2f36;
+}
+
+* { box-sizing: border-box; }
+
+html, body {
+  margin: 0;
+  padding: 0;
+  height: 100%;
+  background: var(--bg);
+  color: var(--text);
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  overflow-x: hidden;
+}
+
+.hidden { display: none !important; }
+
+/* Toolbar */
+.toolbar {
+  position: fixed;
+  top: 16px;
+  left: 16px;
+  display: flex;
+  gap: 8px;
+  z-index: 50;
+}
+
+.icon-btn {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  color: var(--text);
+  padding: 8px 14px;
+  border-radius: 8px;
+  cursor: pointer;
+  font-size: 14px;
+  box-shadow: 0 2px 8px rgba(0,0,0,.35);
+}
+.icon-btn:hover { border-color: var(--accent); color: var(--accent-hover); }
+.icon-btn svg { flex: none; }
+
+/* Centered screens */
+.center-screen {
+  min-height: 100vh;
+  width: 100%;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 16px;
+  padding: 24px;
+  text-align: center;
+}
+
+.big-btn {
+  background: var(--accent);
+  color: #fff;
+  border: none;
+  padding: 22px 40px;
+  font-size: 20px;
+  border-radius: 14px;
+  cursor: pointer;
+  box-shadow: 0 6px 24px rgba(91,141,239,.35);
+  transition: transform .15s ease, background .15s ease;
+}
+.big-btn:hover { background: var(--accent-hover); transform: translateY(-2px); }
+.big-btn.small { padding: 12px 22px; font-size: 15px; }
+
+.link-btn {
+  background: none;
+  border: none;
+  color: var(--dim);
+  text-decoration: underline;
+  cursor: pointer;
+  font-size: 14px;
+}
+.link-btn:hover { color: var(--text); }
+
+.resume-box {
+  margin-top: 8px;
+  padding: 16px 20px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  max-width: 420px;
+}
+.resume-actions {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+  margin-top: 10px;
+}
+
+.dim { color: var(--dim); }
+
+/* Scan progress */
+.progress-outer {
+  width: min(480px, 80vw);
+  height: 14px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  overflow: hidden;
+}
+.progress-inner {
+  height: 100%;
+  width: 0%;
+  background: linear-gradient(90deg, var(--accent), var(--accent-hover));
+  transition: width .2s ease;
+}
+
+/* Player */
+.video-wrap {
+  position: relative;
+  width: min(960px, 92vw);
+  background: #000;
+  border-radius: 10px;
+  overflow: hidden;
+  box-shadow: 0 10px 40px rgba(0,0,0,.5);
+}
+.player-surface {
+  display: block;
+  width: 100%;
+  max-height: 80vh;
+  background: #000;
+  transition: filter .1s ease;
+}
+/* Fullscreen: the browser forces .video-wrap to fill the entire screen (overriding its
+   normal `width: min(960px, 92vw)`), but .player-surface's own sizing rule above is still
+   width-driven with only a max-height cap — its height then just follows from its intrinsic
+   aspect ratio, landing short of the screen's height for most videos. Left as plain block
+   layout, that shorter box just sits at the top, leaving an empty gap below it. Centering
+   the wrap with flex and letting the surface size by both max-width/max-height (whichever
+   constrains first) fills the screen as much as the aspect ratio allows, centered on both
+   axes, matching ordinary fullscreen video-player behavior. */
+.video-wrap:fullscreen,
+.video-wrap:-webkit-full-screen {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 100vw;
+  height: 100vh;
+  border-radius: 0;
+}
+.video-wrap:fullscreen .player-surface,
+.video-wrap:-webkit-full-screen .player-surface {
+  /* width/height auto (intrinsic size) capped by max-width/max-height would only ever
+     shrink an oversized video to fit — for anything smaller than the screen (the common
+     case) it left the video at its native pixel size instead of scaling up to use the
+     screen. object-fit: contain scales it up (or down) to fill the box on whichever axis
+     the aspect ratio allows, same as it would for a plain <video> without object-fit's help
+     — and Chromium applies object-fit to <canvas> too, so this covers both engines. */
+  width: 100%;
+  height: 100%;
+  max-width: none;
+  max-height: none;
+  object-fit: contain;
+}
+.player-surface.blurred {
+  filter: blur(28px) brightness(0.7);
+}
+.blur-badge {
+  position: absolute;
+  top: 14px;
+  right: 14px;
+  background: rgba(0,0,0,.65);
+  color: #fff;
+  padding: 6px 12px;
+  border-radius: 999px;
+  font-size: 13px;
+  letter-spacing: .3px;
+  pointer-events: none;
+}
+/* Overlaid at the bottom of the video/canvas — like the video-wrap's other overlays
+   (blur-badge, audio-track-select) — shown on pointer movement over the player and hidden
+   after a couple seconds of inactivity, same behavior as the mediabunny example this is
+   modeled on. */
+.player-controls {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  padding: 26px 14px 10px;
+  background: linear-gradient(to top, rgba(0,0,0,.75), rgba(0,0,0,0));
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity .2s ease;
+}
+.player-controls.shown {
+  opacity: 1;
+  pointer-events: auto;
+}
+.controls-row {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  margin-top: 8px;
+}
+.control-icon-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: none;
+  border: none;
+  color: #fff;
+  padding: 6px;
+  border-radius: 6px;
+  cursor: pointer;
+  flex: none;
+}
+.control-icon-btn:hover { background: rgba(255,255,255,.15); }
+.time-label {
+  color: #eef0f3;
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  flex: none;
+  text-align: center;
+}
+.time-sep { color: rgba(255,255,255,.5); font-size: 12px; margin: 0 2px; }
+.controls-spacer { flex: 1; }
+
+.seek-bar-container, .volume-bar-container {
+  position: relative;
+  cursor: pointer;
+}
+.seek-bar-container {
+  height: 5px;
+  background: rgba(255,255,255,.25);
+  border-radius: 999px;
+}
+.seek-bar-fill, .volume-bar-fill {
+  height: 100%;
+  width: 0%;
+  background: var(--accent);
+  border-radius: 999px;
+}
+.seek-bar-handle, .volume-bar-handle {
+  position: absolute;
+  top: 50%;
+  left: 0%;
+  width: 11px;
+  height: 11px;
+  background: var(--accent);
+  border-radius: 50%;
+  transform: translate(-50%, -50%);
+  box-shadow: 0 0 0 3px rgba(0,0,0,.25);
+}
+
+.volume-control {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.volume-bar-container {
+  width: 70px;
+  height: 4px;
+  background: rgba(255,255,255,.25);
+  border-radius: 999px;
+}
+.audio-track-select {
+  position: absolute;
+  bottom: 14px;
+  left: 14px;
+  background: rgba(0,0,0,.65);
+  color: #fff;
+  border: none;
+  border-radius: 8px;
+  padding: 6px 10px;
+  font-size: 13px;
+  letter-spacing: .3px;
+  cursor: pointer;
+}
+.audio-track-select option {
+  color: #000;
+}
+.file-name-label {
+  margin-top: 10px;
+  color: var(--dim);
+  font-size: 13px;
+  max-width: 90vw;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Dialogs */
+.dialog-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0,0,0,.55);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 100;
+}
+.dialog {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  padding: 24px 26px;
+  width: min(420px, 90vw);
+  max-height: 85vh;
+  overflow-y: auto;
+  box-shadow: 0 20px 60px rgba(0,0,0,.55);
+}
+.dialog h3 { margin: 0 0 12px; }
+.dialog-header-row {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+.dialog-header-row h3 { margin: 0; }
+.close-x {
+  background: none;
+  border: none;
+  color: var(--dim);
+  font-size: 22px;
+  line-height: 1;
+  cursor: pointer;
+  padding: 0 2px;
+}
+.close-x:hover { color: var(--text); }
+.dialog p { color: var(--dim); font-size: 14px; }
+
+.timecodes-dialog { width: min(560px, 92vw); }
+.timecodes-stats {
+  margin: -4px 0 12px;
+  color: var(--accent-hover);
+}
+.timecodes-content {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 12px 14px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 13px;
+  line-height: 1.6;
+  max-height: 50vh;
+  overflow-y: auto;
+  white-space: pre-wrap;
+  word-break: break-all;
+  color: var(--text);
+  margin: 0;
+}
+
+.snapshot-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(110px, 1fr));
+  gap: 10px;
+  margin: 10px 0 16px;
+  max-height: 40vh;
+  overflow-y: auto;
+  padding-right: 2px;
+}
+.snapshot-grid:empty {
+  display: none;
+}
+.snapshot-item {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.snapshot-thumb-wrap {
+  position: relative;
+  width: 100%;
+  aspect-ratio: 1 / 1;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  overflow: hidden;
+}
+.snapshot-thumb {
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  display: block;
+  cursor: pointer;
+  filter: blur(0);
+  transition: filter .15s ease;
+  opacity: 0;
+}
+.snapshot-thumb.loaded {
+  opacity: 1;
+}
+.snapshot-thumb.blurred {
+  filter: blur(14px);
+}
+.snapshot-thumb-placeholder {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--dim);
+  font-size: 11px;
+  text-align: center;
+  padding: 6px;
+}
+.snapshot-thumb-placeholder.hidden {
+  display: none;
+}
+.snapshot-thumb-placeholder:not(.empty) {
+  background: linear-gradient(90deg, var(--panel) 25%, var(--border) 37%, var(--panel) 63%);
+  background-size: 400% 100%;
+  animation: snapshot-shimmer 1.4s ease infinite;
+}
+@keyframes snapshot-shimmer {
+  0% { background-position: 100% 0; }
+  100% { background-position: 0 0; }
+}
+.snapshot-checkbox {
+  position: absolute;
+  top: 6px;
+  right: 6px;
+  width: 18px;
+  height: 18px;
+  margin: 0;
+  cursor: pointer;
+  accent-color: var(--accent);
+  filter: drop-shadow(0 1px 2px rgba(0,0,0,.6));
+}
+.snapshot-time {
+  font-size: 11px;
+  color: var(--dim);
+  text-align: center;
+  font-variant-numeric: tabular-nums;
+}
+
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin: 16px 0;
+  font-size: 14px;
+}
+.ass-type-option {
+  margin: 14px 0;
+  padding: 12px 14px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+}
+.ass-type-option-title {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text);
+  margin-bottom: 4px;
+}
+.ass-type-option .hint {
+  margin: 0 0 10px;
+}
+.ass-type-option .btn {
+  width: 100%;
+}
+
+.class-thresholds {
+  margin: 12px 0;
+  padding: 12px 14px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+}
+.class-thresholds-heading {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--dim);
+  text-transform: uppercase;
+  letter-spacing: .4px;
+  margin-bottom: 4px;
+}
+.class-thresholds .field {
+  margin: 10px 0;
+}
+.class-thresholds .field:first-of-type {
+  margin-top: 8px;
+}
+.field input[type="range"],
+.field input[type="number"] {
+  accent-color: var(--accent);
+}
+.field input[type="number"] {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  color: var(--text);
+  padding: 6px 8px;
+  border-radius: 6px;
+  width: 120px;
+}
+.checkbox-field {
+  flex-direction: row;
+  align-items: center;
+  gap: 8px;
+}
+.checkbox-field input { width: 16px; height: 16px; }
+.hint { color: var(--dim); font-size: 12px; }
+
+.dialog-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 10px;
+  margin-top: 20px;
+}
+.btn {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  color: var(--text);
+  padding: 9px 16px;
+  border-radius: 8px;
+  cursor: pointer;
+  font-size: 14px;
+}
+.btn:hover { border-color: var(--accent); }
+.btn.primary {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #fff;
+}
+.btn.primary:hover { background: var(--accent-hover); }

@@ -1,0 +1,329 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Video Moderator — nudity scanner &amp; auto-blur player</title>
+<link rel="stylesheet" href="css/style.css">
+<!-- @mediabunny/ac3's bundle imports the core "mediabunny" package via a bare specifier
+     (import ... from "mediabunny") rather than bundling it inline — this import map is what
+     lets that resolve without a bundler. Needed by js/mediabunny-player.js; keep both entries
+     on the same version. -->
+<script type="importmap">
+{
+  "imports": {
+    "mediabunny": "https://cdn.jsdelivr.net/npm/mediabunny@1.55.2/dist/bundles/mediabunny.min.mjs",
+    "@mediabunny/ac3": "https://cdn.jsdelivr.net/npm/@mediabunny/ac3@1.55.2/dist/bundles/mediabunny-ac3.min.mjs"
+  }
+}
+</script>
+</head>
+<body>
+
+<!-- Top-left toolbar: always has Settings; "Open file" appears once a video has been used -->
+<div id="toolbar" class="toolbar">
+  <button id="settingsBtn" class="icon-btn" data-i18n-title="toolbar.settings" data-i18n-aria-label="toolbar.settings">
+    <svg viewBox="0 0 24 24" width="22" height="22"><path fill="currentColor" d="M19.14 12.94a7.14 7.14 0 0 0 .06-.94 7.14 7.14 0 0 0-.06-.94l2.03-1.58a.5.5 0 0 0 .12-.64l-1.92-3.32a.5.5 0 0 0-.6-.22l-2.39.96a7.3 7.3 0 0 0-1.62-.94L14.4 2.7a.5.5 0 0 0-.5-.42h-3.84a.5.5 0 0 0-.5.42l-.36 2.56c-.59.24-1.13.56-1.62.94l-2.39-.96a.5.5 0 0 0-.6.22L2.67 8.84a.5.5 0 0 0 .12.64l2.03 1.58c-.04.31-.06.62-.06.94s.02.63.06.94l-2.03 1.58a.5.5 0 0 0-.12.64l1.92 3.32c.14.24.42.32.6.22l2.39-.96c.49.38 1.03.7 1.62.94l.36 2.56c.05.24.25.42.5.42h3.84c.25 0 .45-.18.5-.42l.36-2.56c.59-.24 1.13-.56 1.62-.94l2.39.96c.24.1.5 0 .6-.22l1.92-3.32a.5.5 0 0 0-.12-.64Zm-7.14 2.44a3.38 3.38 0 1 1 0-6.76 3.38 3.38 0 0 1 0 6.76Z"/></svg>
+    <span data-i18n="toolbar.settings">Settings</span>
+  </button>
+  <button id="openFileBtn" class="icon-btn hidden" data-i18n-title="toolbar.openFileTitle" data-i18n-aria-label="toolbar.openFile">
+    <svg viewBox="0 0 24 24" width="20" height="20"><path fill="currentColor" d="M20 6h-8l-2-2H4a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2Z"/></svg>
+    <span data-i18n="toolbar.openFile">Open file</span>
+  </button>
+  <button id="timecodesBtn" class="icon-btn hidden" data-i18n-title="toolbar.timecodesTitle" data-i18n-aria-label="toolbar.timecodes">
+    <svg viewBox="0 0 24 24" width="20" height="20"><path fill="currentColor" d="M15 1H9v2h6zm-4 13h2V8h-2zm8.03-6.61 1.42-1.42c-.43-.51-.9-.99-1.41-1.41l-1.42 1.42A8.962 8.962 0 0 0 12 4c-4.97 0-9 4.03-9 9s4.02 9 9 9a9 9 0 0 0 7.03-14.61M12 20c-3.87 0-7-3.13-7-7s3.13-7 7-7 7 3.13 7 7-3.13 7-7 7"/></svg>
+    <span data-i18n="toolbar.timecodes">Timecodes</span>
+  </button>
+  <button id="languageBtn" class="icon-btn" data-i18n-title="toolbar.languageTitle" data-i18n-aria-label="toolbar.languageTitle">
+    <svg viewBox="0 0 24 24" width="20" height="20"><path fill="currentColor" d="M12.87 15.07l-2.54-2.51.03-.03c1.74-1.94 2.98-4.17 3.71-6.53H17V4h-7V2H8v2H1v1.99h11.17C11.5 7.92 10.44 9.75 9 11.35 8.07 10.32 7.3 9.19 6.69 8h-2c.73 1.63 1.73 3.17 2.98 4.56l-5.09 5.02L4 19l5-5 3.11 3.11.76-2.04zM18.5 10h-2L12 22h2l1.12-3h4.75L21 22h2l-4.5-12zm-2.62 7l1.62-4.33L19.12 17h-3.24z"/></svg>
+    <span id="languageBtnLabel" data-i18n="toolbar.languageLabel">УКР</span>
+  </button>
+</div>
+
+<!-- Initial / resume screen -->
+<div id="startScreen" class="center-screen">
+  <button id="pickFileBtn" class="big-btn" data-i18n="start.openVideo">🎬 Open Video File</button>
+  <div id="resumeBox" class="resume-box hidden">
+    <p id="resumeText"></p>
+    <div class="resume-actions">
+      <button id="resumeBtn" class="big-btn small" data-i18n="start.resumeBtn">▶ Resume last video</button>
+      <button id="resumeDismissBtn" class="link-btn" data-i18n="start.startOver">start over instead</button>
+    </div>
+  </div>
+</div>
+
+<!-- Scanning progress screen -->
+<div id="scanScreen" class="center-screen hidden">
+  <h2 data-i18n="scan.heading">Scanning video for nudity…</h2>
+  <div class="progress-outer">
+    <div id="scanProgressBar" class="progress-inner" style="width:0%"></div>
+  </div>
+  <p id="scanProgressText">0%</p>
+  <p id="scanStatusText" class="dim" data-i18n="scan.statusLoadingModel">Loading model…</p>
+  <p id="scanTimingText" class="dim hidden"></p>
+  <button id="cancelScanBtn" class="link-btn" data-i18n="scan.cancel">cancel</button>
+</div>
+
+<!-- FFmpeg transcode progress screen -->
+<div id="transcodeScreen" class="center-screen hidden">
+  <h2 data-i18n="transcode.heading">Converting video for playback…</h2>
+  <div class="progress-outer">
+    <div id="transcodeProgressBar" class="progress-inner" style="width:0%"></div>
+  </div>
+  <p id="transcodeProgressText">0%</p>
+  <p id="transcodeStatusText" class="dim" data-i18n="transcode.statusStarting">Starting FFmpeg…</p>
+  <button id="cancelTranscodeBtn" class="link-btn" data-i18n="transcode.cancel">cancel</button>
+</div>
+
+<!-- Player screen -->
+<div id="playerScreen" class="center-screen hidden">
+  <div id="videoWrap" class="video-wrap">
+    <video id="video" class="player-surface" playsinline></video>
+    <canvas id="mediabunnyCanvas" class="player-surface hidden"></canvas>
+    <div id="blurBadge" class="blur-badge hidden" data-i18n="player.blurredBadge">🔒 blurred</div>
+    <select id="audioTrackSelect" class="audio-track-select hidden" data-i18n-title="player.audioTrack" data-i18n-aria-label="player.audioTrack"></select>
+
+    <div id="playerControls" class="player-controls">
+      <div id="seekBarContainer" class="seek-bar-container">
+        <div id="seekBarFill" class="seek-bar-fill"></div>
+        <div id="seekBarHandle" class="seek-bar-handle"></div>
+      </div>
+      <div class="controls-row">
+        <button id="playPauseBtn" class="control-icon-btn" type="button" aria-label="Play">
+          <svg id="playIcon" viewBox="0 0 24 24" width="20" height="20"><path fill="currentColor" d="M8 5v14l11-7z"/></svg>
+          <svg id="pauseIcon" viewBox="0 0 24 24" width="20" height="20" class="hidden"><path fill="currentColor" d="M6 5h4v14H6zm8 0h4v14h-4z"/></svg>
+        </button>
+
+        <div id="volumeControl" class="volume-control">
+          <button id="volumeBtn" class="control-icon-btn" type="button" aria-label="Mute">
+            <svg id="volumeOnIcon" viewBox="0 0 24 24" width="20" height="20"><path fill="currentColor" d="M3 9v6h4l5 5V4L7 9H3zm13.5 3A4.5 4.5 0 0 0 14 7.97v8.05c1.48-.73 2.5-2.25 2.5-4.02zM14 3.23v2.06c2.89.86 5 3.54 5 6.71s-2.11 5.85-5 6.71v2.06c4.01-.91 7-4.49 7-8.77s-2.99-7.86-7-8.77z"/></svg>
+            <svg id="volumeMutedIcon" viewBox="0 0 24 24" width="20" height="20" class="hidden"><path fill="currentColor" d="M16.5 12A4.5 4.5 0 0 0 14 7.97v2.53l2.48 2.48c.01-.16.02-.32.02-.98zm2.5 0c0 .94-.2 1.82-.54 2.64l1.51 1.51C20.63 14.91 21 13.5 21 12c0-4.28-2.99-7.86-7-8.77v2.06c2.89.86 5 3.54 5 6.71zM4.27 3 3 4.27 7.73 9H3v6h4l5 5v-6.73l4.25 4.25c-.67.52-1.42.93-2.25 1.18v2.06a8.99 8.99 0 0 0 3.69-1.81L18.73 21 20 19.73l-9-9L4.27 3zM12 4 9.91 6.09 12 8.18V4z"/></svg>
+          </button>
+          <div id="volumeBarContainer" class="volume-bar-container">
+            <div id="volumeBarFill" class="volume-bar-fill"></div>
+            <div id="volumeBarHandle" class="volume-bar-handle"></div>
+          </div>
+        </div>
+
+        <span id="currentTimeLabel" class="time-label">0:00</span>
+        <span class="time-sep">/</span>
+        <span id="durationLabel" class="time-label">0:00</span>
+
+        <div class="controls-spacer"></div>
+
+        <button id="fullscreenBtn" class="control-icon-btn" type="button" aria-label="Fullscreen">
+          <svg id="enterFullscreenIcon" viewBox="0 0 24 24" width="18" height="18"><path fill="currentColor" d="M7 14H5v5h5v-2H7v-3zm-2-4h2V7h3V5H5v5zm12 7h-3v2h5v-5h-2v3zM14 5v2h3v3h2V5h-5z"/></svg>
+          <svg id="exitFullscreenIcon" viewBox="0 0 24 24" width="18" height="18" class="hidden"><path fill="currentColor" d="M5 16h3v3h2v-5H5v2zm3-8H5v2h5V5H8v3zm6 11h2v-3h3v-2h-5v5zm2-11V5h-2v5h5V8h-3z"/></svg>
+        </button>
+      </div>
+    </div>
+  </div>
+  <div id="fileNameLabel" class="file-name-label"></div>
+</div>
+
+<input type="file" id="fileInput" accept="video/*" class="hidden">
+
+<!-- "Existing timecodes found" dialog -->
+<div id="existingDialogOverlay" class="dialog-overlay hidden">
+  <div class="dialog" role="dialog" aria-modal="true">
+    <h3 data-i18n="existingDialog.title">Existing scan found</h3>
+    <p id="existingDialogText"></p>
+    <div class="dialog-actions">
+      <button id="useExistingBtn" class="btn primary" data-i18n="existingDialog.useExisting">Use existing timecodes</button>
+      <button id="rescanBtn" class="btn" data-i18n="existingDialog.rescan">Rescan video</button>
+    </div>
+  </div>
+</div>
+
+<!-- Detected timecodes list, for the currently loaded/scanned video -->
+<div id="timecodesDialogOverlay" class="dialog-overlay hidden">
+  <div class="dialog timecodes-dialog" role="dialog" aria-modal="true">
+    <h3 data-i18n="timecodesDialog.title">Timecodes</h3>
+    <p id="timecodesStats" class="hint timecodes-stats hidden"></p>
+    <div class="class-thresholds">
+      <div class="class-thresholds-heading" data-i18n="settings.classThresholdsHeading">Per-class sensitivity</div>
+      <div id="classThresholdsTimecodes"></div>
+      <p class="hint" data-i18n="timecodesDialog.classThresholdsHint">Adjust which body parts count as detected — the list below updates live, and these values are also used when exporting timecodes/subtitles.</p>
+    </div>
+    <p class="hint" data-i18n="timecodesDialog.snapshotGridHint">Click a thumbnail to unblur it. Uncheck a scene to exclude it from blur during playback and from subtitle export.</p>
+    <label id="moderationFilterField" class="field checkbox-field hidden">
+      <input type="checkbox" id="moderationFilterInput">
+      <span data-i18n="timecodesDialog.moderationFilterLabel">Show only results confirmed by OpenAI moderation</span>
+    </label>
+    <div id="timecodesSnapshotGrid" class="snapshot-grid"></div>
+    <pre id="timecodesContent" class="timecodes-content"></pre>
+    <div class="dialog-actions">
+      <button id="downloadTimecodesBtn" class="btn primary" data-i18n="timecodesDialog.download">Download</button>
+      <button id="downloadSubtitlesBtn" class="btn" data-i18n="timecodesDialog.downloadSubtitles">Download as subtitles</button>
+      <button id="closeTimecodesBtn" class="btn" data-i18n="timecodesDialog.close">Close</button>
+    </div>
+  </div>
+</div>
+
+<!-- Explains where to save the .ass file before actually triggering the save flow -->
+<div id="assInfoDialogOverlay" class="dialog-overlay hidden">
+  <div class="dialog" role="dialog" aria-modal="true">
+    <div class="dialog-header-row">
+      <h3 data-i18n="assInfoDialog.title">Save subtitle file</h3>
+      <button id="assInfoCloseX" class="close-x" type="button" data-i18n-aria-label="assInfoDialog.close">&times;</button>
+    </div>
+    <p data-i18n-html="assInfoDialog.textHtml">When you click "Save" below, pick the <strong>same folder where the video file is
+      located</strong>, and keep the suggested file name. Most media players automatically
+      load a subtitle file with the same name as the video, sitting next to it — once saved
+      there, these subtitles will play automatically alongside the video, even outside this
+      app. Choose which style to save below.</p>
+
+    <div class="ass-type-option">
+      <div class="ass-type-option-title" data-i18n="assInfoDialog.coverTitle">Full-screen cover</div>
+      <p class="hint" data-i18n="assInfoDialog.coverHint">Shows an opaque intertitle-style card over the whole frame for the duration of each scene (plus "Blur in advance" on both sides) — hides the content completely, like this app's own in-player blur.</p>
+      <button id="assInfoSaveCoverBtn" class="btn primary" data-i18n="assInfoDialog.save">Save</button>
+    </div>
+
+    <div class="ass-type-option">
+      <div class="ass-type-option-title" data-i18n="assInfoDialog.countdownTitle">Countdown warning</div>
+      <p class="hint" data-i18n="assInfoDialog.countdownHint">Shows a small heads-up text counting down the seconds until each scene starts, instead of covering anything — lets you look away or skip ahead in time rather than hiding the video.</p>
+      <button id="assInfoSaveCountdownBtn" class="btn primary" data-i18n="assInfoDialog.save">Save</button>
+    </div>
+  </div>
+</div>
+
+<!-- "Unsupported format, offer to transcode" warning dialog -->
+<div id="transcodeWarningOverlay" class="dialog-overlay hidden">
+  <div class="dialog" role="dialog" aria-modal="true">
+    <h3 id="transcodeWarningTitle">Format not supported for playback</h3>
+    <p><span id="transcodeReasonText"></span> <span id="transcodeFileName"></span>
+      <span id="transcodeReasonSuffix"></span></p>
+    <div class="dialog-actions">
+      <button id="transcodeConfirmBtn" class="btn primary" data-i18n="transcodeWarning.confirm">Convert with FFmpeg</button>
+      <button id="transcodeCancelBtn" class="btn">Cancel</button>
+    </div>
+  </div>
+</div>
+
+<!-- Settings dialog -->
+<div id="settingsDialogOverlay" class="dialog-overlay hidden">
+  <div class="dialog" role="dialog" aria-modal="true">
+    <h3 data-i18n="settings.title">Settings</h3>
+
+    <label class="field">
+      <span><span data-i18n="settings.sensitivity">Sensitivity</span> <b id="sensitivityValue"></b></span>
+      <input type="range" id="sensitivityInput" min="0" max="1" step="0.01">
+      <span class="hint" data-i18n="settings.sensitivityHint">Blur triggers only when detected probability is ≥ this value.</span>
+    </label>
+
+    <div class="class-thresholds">
+      <div class="class-thresholds-heading" data-i18n="settings.classThresholdsHeading">Per-class sensitivity</div>
+      <div id="classThresholdsSettings"></div>
+      <p class="hint" data-i18n="settings.classThresholdsHint">Fine-tune sensitivity separately for each detected body part. A sample only counts as detected if at least one of these is met — the general sensitivity above then decides whether that counts as enough to blur.</p>
+    </div>
+
+    <label class="field">
+      <span data-i18n="settings.blurAdvance">Blur in advance (seconds)</span>
+      <input type="number" id="blurAdvanceInput" min="0" step="0.1">
+      <span class="hint" data-i18n="settings.blurAdvanceHint">Start blurring this many seconds before a flagged scene begins, and
+        keep it blurred for this many seconds after the scene ends.</span>
+    </label>
+
+    <label class="field">
+      <span data-i18n="settings.scanInterval">Scan interval (seconds)</span>
+      <input type="number" id="scanIntervalInput" min="0.01" step="0.05">
+      <span class="hint" id="scanIntervalComputedHint"></span>
+      <span class="hint" data-i18n="settings.scanIntervalHint">Gap between sampled frames while scanning. Smaller = more accurate
+        scene start/end times, but a slower scan. With adaptive scan (below) on, this is the
+        gap used <em>inside</em> a region it's already refining — the initial sweep of the
+        rest of the video uses a coarser, auto-derived gap (roughly 5x this value, capped at
+        5s) regardless of how small you set this. Turn adaptive scan off if you need this
+        exact gap applied everywhere. Applies to scans started after this is changed —
+        rescan a video to apply it retroactively.</span>
+    </label>
+
+    <label class="field checkbox-field">
+      <input type="checkbox" id="adaptiveScanInput">
+      <span data-i18n="settings.adaptiveScan">Adaptive two-pass scan (faster)</span>
+    </label>
+    <p class="hint" style="margin-top:-10px;" data-i18n="settings.adaptiveScanHint">Scans a fast coarse pass first (gap: roughly
+      5x the scan interval above, capped at 5s), then re-scans at the full scan-interval
+      precision only around anything that pass finds. Much faster on long videos, since most
+      of a video is usually clean. A scene shorter than the coarse pass's gap that falls
+      entirely between two clean coarse samples can still be missed — turn this off for
+      maximum thoroughness on content you don't trust a coarse pass with, or on content with
+      very brief scenes. Changing this — like scan interval — only affects scans started
+      afterward.</p>
+
+    <div class="field">
+      <span data-i18n="settings.detectionMethod">Detection method</span>
+      <label class="checkbox-field hidden">
+        <input type="radio" name="detectionMode" id="modeNsfwjsInput" value="nsfwjs">
+        <span data-i18n="settings.modeNsfwjs">NSFWJS only (fastest)</span>
+      </label>
+      <label class="checkbox-field hidden">
+        <input type="radio" name="detectionMode" id="modeConfirmInput" value="confirm">
+        <span data-i18n="settings.modeConfirm">NSFWJS + NudeNet confirmation (recommended)</span>
+      </label>
+      <label class="checkbox-field">
+        <input type="radio" name="detectionMode" id="modeNudenetInput" value="nudenet">
+        <span data-i18n="settings.modeNudenet">NudeNet only (most precise, slowest)</span>
+      </label>
+      <span class="hint" data-i18n="settings.detectionHint">NSFWJS alone sometimes flags frames with a lot of visible skin but
+        no actual nudity (bare neck/shoulders/midriff, etc) — it has no real anatomical
+        understanding. NudeNet is a real body-part detector: it only counts a frame if it
+        specifically finds an exposed breast, genitals, or anus. "Confirmation" uses NSFWJS
+        as a cheap first pass and only asks NudeNet to double-check frames NSFWJS already
+        flagged — good balance of speed and accuracy. "NudeNet only" skips NSFWJS entirely
+        and runs the body-part detector directly on every sampled frame — most accurate,
+        since NSFWJS never gets a vote. Either NudeNet mode downloads its ~12MB model the
+        first time it's needed.</span>
+    </div>
+
+    <label class="field checkbox-field">
+      <input type="checkbox" id="nudenetExactTimingInput">
+      <span data-i18n="settings.exactTiming">Exact NudeNet timing (no averaging)</span>
+    </label>
+    <p class="hint" style="margin-top:-10px;" data-i18n="settings.exactTimingHint">Whenever NudeNet checks several nearby frames
+      in a row (a sustained scene), it normally only classifies a few of them and fills in
+      the rest by copying the nearest one's result — fast, but the scene's start/end time is
+      only as precise as which frames happened to get checked. Turn this on to classify
+      every single candidate frame with NudeNet instead, giving the real scene-boundary
+      time at your configured scan interval — more NudeNet calls, so slower. Only matters
+      for "confirmation" and "NudeNet only" detection modes above; ignored for NSFWJS-only.</p>
+
+    <label class="field checkbox-field">
+      <input type="checkbox" id="rememberStateInput">
+      <span data-i18n="settings.rememberState">Remember state after reload</span>
+    </label>
+
+    <div class="class-thresholds">
+      <div class="class-thresholds-heading" data-i18n="settings.openaiModerationHeading">AI confirmation (optional)</div>
+      <label class="field checkbox-field">
+        <input type="checkbox" id="openaiModerationInput">
+        <span data-i18n="settings.openaiModerationEnabled">Confirm detected scenes with OpenAI Moderation API</span>
+      </label>
+      <label class="field">
+        <span data-i18n="settings.openaiApiKeyLabel">OpenAI API key</span>
+        <input type="password" id="openaiApiKeyInput" autocomplete="off" spellcheck="false" data-i18n-placeholder="settings.openaiApiKeyPlaceholder">
+      </label>
+      <p class="hint" data-i18n-html="settings.openaiApiKeyHintHtml">...</p>
+    </div>
+
+    <div class="dialog-actions">
+      <button id="closeSettingsBtn" class="btn primary" data-i18n="settings.close">Close</button>
+    </div>
+  </div>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.20.0/dist/tf.min.js"></script>
+<!-- NSFWJS browser bundle + the MobileNetV2 model files it expects to find as globals (window.model / window.group1_shard1of1) -->
+<script src="https://cdn.jsdelivr.net/npm/nsfwjs@4.4.0/dist/models/mobilenet_v2/model.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/nsfwjs@4.4.0/dist/models/mobilenet_v2/group1-shard1of1.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/nsfwjs@4.4.0/dist/browser/nsfwjs.min.js"></script>
+<script src="js/i18n.js"></script>
+<script src="js/db.js"></script>
+<script src="js/scanner.js"></script>
+<script src="js/transcoder.js"></script>
+<script src="js/mediabunny-player.js"></script>
+<script src="js/ass-export.js"></script>
+<script src="js/snapshots.js"></script>
+<script src="js/openai-moderation.js"></script>
+<script src="js/app.js"></script>
+</body>
+</html>

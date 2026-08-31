@@ -222,7 +222,7 @@ let mediabunnySampleIterator = null;
 // specifiers in the bundle), so this doesn't need one either.
 function loadMediabunny() {
   if (!mediabunnyModulePromise) {
-    mediabunnyModulePromise = import("https://cdn.jsdelivr.net/npm/mediabunny@1.55.2/dist/bundles/mediabunny.min.mjs");
+    mediabunnyModulePromise = import("https://cdn.jsdelivr.net/npm/mediabunny@1.55.5/dist/bundles/mediabunny.min.mjs");
   }
   return mediabunnyModulePromise;
 }

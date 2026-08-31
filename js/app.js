@@ -26,7 +26,7 @@
 
   const DEFAULT_SETTINGS = {
     language: "uk",
-    sensitivity: 0.5,
+    sensitivity: 0.09,
     // Per-class re-thresholds on top of NudeNet's own per-part scores — see
     // VMScanner.applyClassThresholds. 0 for every class by default: a sample counts as soon
     // as NudeNet reported anything for a class at all, identical to behavior before this

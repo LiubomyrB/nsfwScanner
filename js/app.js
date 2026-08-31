@@ -33,6 +33,10 @@
     // feature existed.
     classThresholds: defaultClassThresholds(),
     blurAdvance: 1.5,
+    // CSS filter: blur() radius, in px, applied to the player surface during a blurred
+    // segment — see setBlur/applyBlurRadius and .player-surface.blurred's own --blur-radius
+    // custom property. 28 matches this app's original hardcoded (non-configurable) value.
+    blurRadius: 28,
     rememberState: true,
     scanInterval: 0.1,
     adaptiveScan: true,
@@ -141,6 +145,7 @@
       "transcodeWarningOverlay", "transcodeWarningTitle", "transcodeReasonText", "transcodeFileName",
       "transcodeReasonSuffix", "transcodeConfirmBtn", "transcodeCancelBtn",
       "settingsDialogOverlay", "sensitivityInput", "sensitivityValue", "classThresholdsSettings", "blurAdvanceInput",
+      "blurRadiusInput", "blurRadiusValue",
       "scanIntervalInput", "scanIntervalComputedHint", "adaptiveScanInput", "rememberStateInput", "closeSettingsBtn",
       "modeNsfwjsInput", "modeConfirmInput", "modeNudenetInput", "nudenetExactTimingInput",
       "openaiModerationInput", "toggleOwnApiKeyBtn", "openaiApiKeyField", "openaiApiKeyInput",
@@ -228,6 +233,7 @@
 
     els.sensitivityInput.addEventListener("input", onSensitivityChange);
     els.blurAdvanceInput.addEventListener("change", onBlurAdvanceChange);
+    els.blurRadiusInput.addEventListener("input", onBlurRadiusChange);
     els.scanIntervalInput.addEventListener("change", onScanIntervalChange);
     els.scanIntervalInput.addEventListener("input", updateScanIntervalComputedHint);
     els.adaptiveScanInput.addEventListener("change", onAdaptiveScanChange);
@@ -316,6 +322,9 @@
     els.sensitivityInput.value = settings.sensitivity;
     els.sensitivityValue.textContent = settings.sensitivity.toFixed(2);
     els.blurAdvanceInput.value = settings.blurAdvance;
+    els.blurRadiusInput.value = settings.blurRadius;
+    els.blurRadiusValue.textContent = settings.blurRadius + "px";
+    applyBlurRadius();
     els.scanIntervalInput.value = settings.scanInterval;
     els.adaptiveScanInput.checked = !!settings.adaptiveScan;
     els.detectionModeInputs.forEach((input) => { input.checked = input.value === settings.detectionMode; });
@@ -727,6 +736,21 @@
     const v = parseFloat(e.target.value);
     settings.blurAdvance = isFinite(v) && v >= 0 ? v : 0;
     els.blurAdvanceInput.value = settings.blurAdvance;
+    persistSettings();
+  }
+
+  // Pushes settings.blurRadius onto the root element as a CSS custom property —
+  // .player-surface.blurred (css/style.css) reads it via filter: blur(var(--blur-radius)).
+  // Applied globally (not scoped to els.videoWrap) so it takes effect immediately even before
+  // a video is loaded, same as applySettingsToInputs calling this on startup.
+  function applyBlurRadius() {
+    document.documentElement.style.setProperty("--blur-radius", settings.blurRadius + "px");
+  }
+
+  function onBlurRadiusChange(e) {
+    settings.blurRadius = parseFloat(e.target.value);
+    els.blurRadiusValue.textContent = settings.blurRadius + "px";
+    applyBlurRadius();
     persistSettings();
   }
 

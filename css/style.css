@@ -168,7 +168,9 @@ html, body {
   object-fit: contain;
 }
 .player-surface.blurred {
-  filter: blur(28px) brightness(0.7);
+  /* --blur-radius is set on the root element from settings.blurRadius (see app.js's
+     applyBlurRadius) — 28px is only a fallback for the moment before that first runs. */
+  filter: blur(var(--blur-radius, 28px)) brightness(0.7);
 }
 .blur-badge {
   position: absolute;

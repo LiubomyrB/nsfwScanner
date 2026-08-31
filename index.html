@@ -298,11 +298,12 @@
         <input type="checkbox" id="openaiModerationInput">
         <span data-i18n="settings.openaiModerationEnabled">Confirm detected scenes with OpenAI Moderation API</span>
       </label>
-      <label class="field">
+      <button type="button" id="toggleOwnApiKeyBtn" class="link-btn" data-i18n="settings.useOwnApiKeyLink">Use my own OpenAI API key</button>
+      <label class="field hidden" id="openaiApiKeyField">
         <span data-i18n="settings.openaiApiKeyLabel">OpenAI API key</span>
         <input type="password" id="openaiApiKeyInput" autocomplete="off" spellcheck="false" data-i18n-placeholder="settings.openaiApiKeyPlaceholder">
+        <span class="hint" data-i18n-html="settings.openaiApiKeyHintHtml">...</span>
       </label>
-      <p class="hint" data-i18n-html="settings.openaiApiKeyHintHtml">...</p>
     </div>
 
     <div class="dialog-actions">

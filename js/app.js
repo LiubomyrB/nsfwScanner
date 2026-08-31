@@ -49,12 +49,22 @@
     nudenetExactTiming: false,
     // Optional secondary confirmation pass, run client-side after a local scan finishes (see
     // runOpenAIModerationPass) — re-checks each detected scene's peak frame against OpenAI's
-    // real Moderation API. Goes through api/openai-moderation.php, a transparent same-origin
-    // relay (see js/openai-moderation.js's own comment for why — OpenAI's API sends no CORS
-    // headers, so a browser can't call it directly at all) that forwards the key straight
-    // through without storing it. Off unless both fields are set.
+    // real Moderation API. Goes through a same-origin-CORS relay (see js/openai-moderation.js's
+    // own comment for why — OpenAI's API sends no CORS headers, so a browser can't call it
+    // directly at all). By default the relay itself holds the API key (see
+    // cloudflare-worker/openai-moderation-worker.js's OPENAI_API_KEY secret) and no key needs
+    // to be configured here at all; useOwnOpenAIApiKey/openaiApiKey are only relevant if the
+    // user opts into supplying their own key instead, which then overrides the relay's stored
+    // one. Off unless cloudflareWorkerUrl (or, for "php", api/openai-moderation.php) is set.
     openaiModerationEnabled: false,
+    useOwnOpenAIApiKey: false,
     openaiApiKey: "",
+    // "cloudflare" (default): the deployed Cloudflare Worker at cloudflareWorkerUrl below —
+    // see cloudflare-worker/openai-moderation-worker.js — no dependency on this app's own
+    // host. "php": api/openai-moderation.php, same origin as this app, no separate deployment.
+    // Neither is exposed in the Settings UI — change these here in code instead.
+    moderationProxyMethod: "cloudflare",
+    cloudflareWorkerUrl: "https://github-moderation-proxy.palianycia.workers.dev/",
   };
 
   /** @type {Record<string, any>} */
@@ -133,7 +143,7 @@
       "settingsDialogOverlay", "sensitivityInput", "sensitivityValue", "classThresholdsSettings", "blurAdvanceInput",
       "scanIntervalInput", "scanIntervalComputedHint", "adaptiveScanInput", "rememberStateInput", "closeSettingsBtn",
       "modeNsfwjsInput", "modeConfirmInput", "modeNudenetInput", "nudenetExactTimingInput",
-      "openaiModerationInput", "openaiApiKeyInput",
+      "openaiModerationInput", "toggleOwnApiKeyBtn", "openaiApiKeyField", "openaiApiKeyInput",
     ].forEach((id) => { els[id] = document.getElementById(id); });
     els.detectionModeInputs = [els.modeNsfwjsInput, els.modeConfirmInput, els.modeNudenetInput];
   }
@@ -225,6 +235,7 @@
     els.rememberStateInput.addEventListener("change", onRememberStateChange);
     els.openaiModerationInput.addEventListener("change", onOpenaiModerationChange);
     els.openaiApiKeyInput.addEventListener("change", onOpenaiApiKeyChange);
+    els.toggleOwnApiKeyBtn.addEventListener("click", onToggleOwnApiKey);
 
     els.useExistingBtn.addEventListener("click", async () => {
       const cb = pendingExisting && pendingExisting.onUseExisting;
@@ -280,6 +291,14 @@
     // default. Merged key-by-key so an older persisted record missing a class added later
     // still gets that class's default (0) rather than `undefined`.
     merged.classThresholds = Object.assign({}, DEFAULT_SETTINGS.classThresholds, (s && s.classThresholds) || {});
+    // moderationProxyMethod/cloudflareWorkerUrl are code-only now (no Settings UI writes
+    // them), so always take the current code value rather than whatever got persisted back
+    // when the UI still had a field for this — otherwise an old record's now-stale value
+    // (e.g. an empty cloudflareWorkerUrl from before it had a real default) would silently
+    // shadow the code default forever, since a plain Object.assign prefers `s`'s value
+    // whenever the key is present at all, even when that value is "".
+    merged.moderationProxyMethod = DEFAULT_SETTINGS.moderationProxyMethod;
+    merged.cloudflareWorkerUrl = DEFAULT_SETTINGS.cloudflareWorkerUrl;
     // Migrate the old boolean setting (pre-"NudeNet only" mode) to the new 3-way mode.
     if (s && !("detectionMode" in s) && "nudeNetConfirm" in s) {
       merged.detectionMode = s.nudeNetConfirm ? "confirm" : "nsfwjs";
@@ -303,9 +322,24 @@
     els.rememberStateInput.checked = !!settings.rememberState;
     els.openaiModerationInput.checked = !!settings.openaiModerationEnabled;
     els.openaiApiKeyInput.value = settings.openaiApiKey || "";
-    els.openaiApiKeyInput.disabled = !settings.openaiModerationEnabled;
+    updateModerationFieldStates();
     updateScanIntervalComputedHint();
     syncClassThresholdInputs();
+  }
+
+  // Shared by applySettingsToInputs (on load/dialog-open) and the moderation/toggle change
+  // handlers — disabled state depends on openaiModerationEnabled, and whether the API-key
+  // field is shown at all depends on useOwnOpenAIApiKey, so both need re-syncing whenever
+  // either one changes, not just the one the user actually touched. Also called by
+  // refreshDynamicTexts() after a language switch, since the toggle button's own label
+  // depends on useOwnOpenAIApiKey too.
+  function updateModerationFieldStates() {
+    const enabled = !!settings.openaiModerationEnabled;
+    els.toggleOwnApiKeyBtn.disabled = !enabled;
+    const ownKey = !!settings.useOwnOpenAIApiKey;
+    els.toggleOwnApiKeyBtn.textContent = VMI18n.t(ownKey ? "settings.useWorkerKeyLink" : "settings.useOwnApiKeyLink");
+    els.openaiApiKeyField.classList.toggle("hidden", !ownKey);
+    els.openaiApiKeyInput.disabled = !enabled || !ownKey;
   }
 
   // key -> [{ input, valueEl }, ...] — one entry per dialog the sliders were built into
@@ -700,12 +734,18 @@
 
   function onOpenaiModerationChange(e) {
     settings.openaiModerationEnabled = !!e.target.checked;
-    els.openaiApiKeyInput.disabled = !settings.openaiModerationEnabled;
+    updateModerationFieldStates();
     persistSettings();
   }
 
   function onOpenaiApiKeyChange(e) {
     settings.openaiApiKey = e.target.value.trim();
+    persistSettings();
+  }
+
+  function onToggleOwnApiKey() {
+    settings.useOwnOpenAIApiKey = !settings.useOwnOpenAIApiKey;
+    updateModerationFieldStates();
     persistSettings();
   }
 
@@ -956,11 +996,22 @@
 
   // ---------- scanning ----------
 
+  // Resolves settings.moderationProxyMethod to the actual relay URL to send moderation
+  // requests through — see js/openai-moderation.js's own header comment for why a relay is
+  // needed at all, and the two implementations that ship with this app.
+  function getModerationEndpoint() {
+    return settings.moderationProxyMethod === "php"
+      ? VMOpenAIModeration.phpEndpointUrl()
+      : settings.cloudflareWorkerUrl;
+  }
+
   // After a local scan finds `segments`, optionally re-checks each one's peak frame (the
   // moment mergeSegments recorded as having triggered the detection — same frame the
   // snapshot grid thumbnails) against OpenAI's real Moderation API, as a secondary opinion
-  // gated by settings.openaiModerationEnabled + settings.openaiApiKey (see js/openai-
-  // moderation.js). Runs strictly sequentially — one capture-then-check per scene, not
+  // gated by settings.openaiModerationEnabled + a configured relay endpoint (see js/openai-
+  // moderation.js — the relay itself supplies the API key by default; openaiApiKey is only
+  // sent when useOwnOpenAIApiKey opts into overriding that). Runs strictly sequentially — one
+  // capture-then-check per scene, not
   // pooled/concurrent — both to keep this simple and to stay well clear of whatever rate
   // limit the user's own key is subject to; a scan with many detected scenes will take a
   // while here, hence the "Confirming N/M with OpenAI…" status text. Returns a
@@ -975,6 +1026,7 @@
     const items = segments.map((seg) => ({ time: typeof seg.peakTime === "number" ? seg.peakTime : seg.start }));
     els.scanStatusText.textContent = VMI18n.t("scan.statusModerationCapturing");
     const dataUrls = await VMSnapshots.captureFullFrameBatch(file, items);
+    const endpoint = getModerationEndpoint();
 
     for (let i = 0; i < segments.length; i++) {
       if (token && token.cancelled) break;
@@ -982,7 +1034,8 @@
       if (!dataUrl) continue;
       els.scanStatusText.textContent = VMI18n.t("scan.statusModerationChecking", { current: i + 1, count: segments.length });
       try {
-        const result = await VMOpenAIModeration.checkImage(settings.openaiApiKey, dataUrl);
+        const ownApiKey = settings.useOwnOpenAIApiKey ? settings.openaiApiKey : undefined;
+        const result = await VMOpenAIModeration.checkImage(ownApiKey, dataUrl, endpoint);
         verdicts.set(roundTime(items[i].time), result.flagged ? "confirmed" : "rejected");
       } catch (err) {
         console.warn("OpenAI Moderation check failed for one scene.", err);
@@ -1024,7 +1077,11 @@
       // own "Download" button (see downloadTimecodesBtn's handler) whenever they want it.
       const txt = VMScanner.segmentsToTxt(segments, keyName);
 
-      const moderationUsed = !!(settings.openaiModerationEnabled && settings.openaiApiKey);
+      const moderationUsed = !!(
+        settings.openaiModerationEnabled
+        && (settings.moderationProxyMethod === "php" || settings.cloudflareWorkerUrl)
+        && (!settings.useOwnOpenAIApiKey || settings.openaiApiKey)
+      );
       let moderationVerdicts = new Map();
       if (moderationUsed && !(cancelToken && cancelToken.cancelled)) {
         // Isolated from the outer try/catch on purpose: this is a secondary, optional check
@@ -1841,6 +1898,7 @@
   // called right after the language toggle switches VMI18n's current language.
   function refreshDynamicTexts() {
     updateScanIntervalComputedHint();
+    updateModerationFieldStates();
     if (activeVideo) {
       updatePlayerControls(currentPlaybackTime());
       updateVolumeUI();

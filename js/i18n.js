@@ -116,9 +116,9 @@
       "assInfoDialog.title": "Save subtitle file",
       "assInfoDialog.textHtml": 'When you click "Save" below, pick the <strong>same folder where the video file is located</strong>, and keep the suggested file name. Most media players automatically load a subtitle file with the same name as the video, sitting next to it — once saved there, these subtitles will play automatically alongside the video, even outside this app. Choose which style to save below.',
       "assInfoDialog.coverTitle": "Full-screen cover",
-      "assInfoDialog.coverHint": 'Shows an opaque intertitle-style card over the whole frame for the duration of each scene (plus "Blur in advance" on both sides) — hides the content completely, like this app\'s own in-player blur.',
+      "assInfoDialog.coverHint": 'Shows an opaque intertitle-style card over the whole frame for the duration of each scene',
       "assInfoDialog.countdownTitle": "Countdown warning",
-      "assInfoDialog.countdownHint": "Shows a small heads-up text counting down the seconds until each scene starts, instead of covering anything — lets you look away or skip ahead in time rather than hiding the video.",
+      "assInfoDialog.countdownHint": "Shows a small heads-up text counting down the seconds until each scene starts.",
       "assInfoDialog.save": "Save",
       "assInfoDialog.close": "Close",
 
@@ -165,9 +165,11 @@
 
       "settings.openaiModerationHeading": "AI confirmation (optional)",
       "settings.openaiModerationEnabled": "Confirm detected scenes with OpenAI Moderation API",
+      "settings.useOwnApiKeyLink": "Use my own OpenAI API key",
+      "settings.useWorkerKeyLink": "Use the key stored on the Worker instead",
       "settings.openaiApiKeyLabel": "OpenAI API key",
       "settings.openaiApiKeyPlaceholder": "sk-...",
-      "settings.openaiApiKeyHintHtml": 'After a scan finds scenes, each one\'s peak frame is sent for a second opinion to OpenAI\'s Moderation API through a small same-server relay (OpenAI\'s API doesn\'t accept requests directly from a browser) — the relay forwards your key straight through to OpenAI and never stores it. Get a key from <a href="https://platform.openai.com/api-keys" target="_blank" rel="noopener noreferrer">platform.openai.com/api-keys</a>; see <a href="https://platform.openai.com/docs/guides/moderation" target="_blank" rel="noopener noreferrer">the Moderation API docs</a> for how it works. The key itself is stored only in this browser.',
+      "settings.openaiApiKeyHintHtml": 'Sent with each request and overrides the Worker\'s own stored key for that request — the relay forwards it straight through to OpenAI and never stores it. Get a key from <a href="https://platform.openai.com/api-keys" target="_blank" rel="noopener noreferrer">platform.openai.com/api-keys</a>; see <a href="https://platform.openai.com/docs/guides/moderation" target="_blank" rel="noopener noreferrer">the Moderation API docs</a> for how it works. The key itself is stored only in this browser.',
       "settings.close": "Close",
 
       "intertitle.text": "Censored scene",
@@ -285,9 +287,9 @@
       "assInfoDialog.title": "Зберегти файл субтитрів",
       "assInfoDialog.textHtml": 'Натиснувши «Зберегти» нижче, оберіть <strong>ту саму папку, де знаходиться відеофайл</strong>, і залиште запропоновану назву файлу без змін. Більшість медіаплеєрів автоматично завантажують файл субтитрів з такою самою назвою, як і у відео, що лежить поруч — після збереження туди ці субтитри автоматично відтворюватимуться разом із відео, навіть поза цим застосунком. Оберіть стиль нижче.',
       "assInfoDialog.coverTitle": "Повноекранне прикриття",
-      "assInfoDialog.coverHint": "Показує непрозору картку у стилі інтертитру на весь кадр протягом усієї сцени (плюс «Розмиття завчасно» з обох боків) — повністю приховує вміст, як і власне розмиття цього застосунку.",
+      "assInfoDialog.coverHint": "Показує непрозору картку у стилі інтертитру на весь кадр протягом усієї сцени.",
       "assInfoDialog.countdownTitle": "Попередження зі зворотним відліком",
-      "assInfoDialog.countdownHint": "Показує невеликий текст-попередження зі зворотним відліком секунд до початку сцени, замість того щоб щось приховувати — дає змогу відвести погляд або перемотати заздалегідь, а не приховує відео.",
+      "assInfoDialog.countdownHint": "Показує невеликий текст-попередження зі зворотним відліком секунд до початку сцени.",
       "assInfoDialog.save": "Зберегти",
       "assInfoDialog.close": "Закрити",
 
@@ -334,9 +336,11 @@
 
       "settings.openaiModerationHeading": "Підтвердження через ШІ (необов'язково)",
       "settings.openaiModerationEnabled": "Підтверджувати знайдені сцени через OpenAI Moderation API",
+      "settings.useOwnApiKeyLink": "Використати власний ключ API OpenAI",
+      "settings.useWorkerKeyLink": "Використати ключ, збережений на Worker",
       "settings.openaiApiKeyLabel": "Ключ API OpenAI",
       "settings.openaiApiKeyPlaceholder": "sk-...",
-      "settings.openaiApiKeyHintHtml": 'Після сканування пікові кадри кожної знайденої сцени надсилаються для додаткової перевірки до OpenAI Moderation API через невеликий проміжний сервіс на цьому ж сервері (API OpenAI не приймає запити напряму з браузера) — цей сервіс лише передає ваш ключ до OpenAI і ніде його не зберігає. Отримати ключ можна на <a href="https://platform.openai.com/api-keys" target="_blank" rel="noopener noreferrer">platform.openai.com/api-keys</a>; про роботу цього API читайте <a href="https://platform.openai.com/docs/guides/moderation" target="_blank" rel="noopener noreferrer">в документації Moderation API</a>. Сам ключ зберігається лише в цьому браузері.',
+      "settings.openaiApiKeyHintHtml": 'Надсилається з кожним запитом і замінює власний збережений ключ Worker для цього запиту — проміжний сервіс лише передає його до OpenAI і ніде не зберігає. Отримати ключ можна на <a href="https://platform.openai.com/api-keys" target="_blank" rel="noopener noreferrer">platform.openai.com/api-keys</a>; про роботу цього API читайте <a href="https://platform.openai.com/docs/guides/moderation" target="_blank" rel="noopener noreferrer">в документації Moderation API</a>. Сам ключ зберігається лише в цьому браузері.',
       "settings.close": "Закрити",
 
       "intertitle.text": "Сцену приховано",

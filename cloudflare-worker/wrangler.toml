@@ -1,0 +1,6 @@
+# Optional — only needed for CLI deployment (`npx wrangler deploy` from this directory).
+# Pasting openai-moderation-worker.js directly into the Cloudflare dashboard's editor also
+# works fine and doesn't need this file at all.
+name = "openai-moderation-worker"
+main = "openai-moderation-worker.js"
+compatibility_date = "2026-08-31"

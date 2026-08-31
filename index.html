@@ -226,6 +226,12 @@
     </label>
 
     <label class="field">
+      <span><span data-i18n="settings.blurRadius">Blur radius</span> <b id="blurRadiusValue"></b></span>
+      <input type="range" id="blurRadiusInput" min="4" max="60" step="1">
+      <span class="hint" data-i18n="settings.blurRadiusHint">How strong the blur effect is during playback — a larger value blurs more.</span>
+    </label>
+
+    <label class="field">
       <span data-i18n="settings.scanInterval">Scan interval (seconds)</span>
       <input type="number" id="scanIntervalInput" min="0.01" step="0.05">
       <span class="hint" id="scanIntervalComputedHint"></span>

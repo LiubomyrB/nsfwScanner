@@ -56,7 +56,7 @@
     // to be configured here at all; useOwnOpenAIApiKey/openaiApiKey are only relevant if the
     // user opts into supplying their own key instead, which then overrides the relay's stored
     // one. Off unless cloudflareWorkerUrl (or, for "php", api/openai-moderation.php) is set.
-    openaiModerationEnabled: false,
+    openaiModerationEnabled: true,
     useOwnOpenAIApiKey: false,
     openaiApiKey: "",
     // "cloudflare" (default): the deployed Cloudflare Worker at cloudflareWorkerUrl below —
@@ -135,7 +135,7 @@
       "fileInput",
       "existingDialogOverlay", "existingDialogText", "useExistingBtn", "rescanBtn",
       "timecodesDialogOverlay", "timecodesStats", "classThresholdsTimecodes", "timecodesSnapshotGrid", "timecodesContent",
-      "moderationFilterField", "moderationFilterInput",
+      "moderationFilterField", "moderationFilterInput", "snapshotGridCountHint",
       "downloadTimecodesBtn", "downloadSubtitlesBtn", "closeTimecodesBtn",
       "assInfoDialogOverlay", "assInfoCloseX", "assInfoSaveCoverBtn", "assInfoSaveCountdownBtn",
       "transcodeWarningOverlay", "transcodeWarningTitle", "transcodeReasonText", "transcodeFileName",
@@ -176,6 +176,7 @@
       if (e.target === els.timecodesDialogOverlay) closeTimecodesDialog();
     });
     els.moderationFilterInput.addEventListener("change", () => {
+      updateSnapshotGridCountHint();
       renderTimecodesTextList();
       scheduleSnapshotGridRender(true);
     });
@@ -465,22 +466,49 @@
     // Full list (every detected segment, checked or not) — kept as-is so the snapshot grid
     // below can still show/toggle every segment, including ones currently unchecked.
     activeVideo.liveTimecodesSegments = VMScanner.mergeSegments(filtered, VMScanner.REPORT_FLOOR, activeVideo.interval);
+    updateSnapshotGridCountHint();
     renderTimecodesTextList();
   }
 
-  // Drops any segment OpenAI Moderation didn't confirm, when the dialog's own filter
-  // checkbox is on — display-only (see its own hint text: "we show...") and gated behind
-  // both activeVideo.moderationUsed (the checkbox is hidden otherwise, but this function can
-  // be called before that's checked) and the checkbox's own state. Deliberately NOT applied
-  // by currentFilteredTimecodesSegments (download/ASS export) — those should keep exporting
+  // Drops any segment OpenAI Moderation actively ruled out ("rejected"), when the dialog's
+  // own filter checkbox is on — display-only (see its own hint text: "we show...") and gated
+  // behind both activeVideo.moderationUsed (the checkbox is hidden otherwise, but this
+  // function can be called before that's checked) and the checkbox's own state. A segment
+  // whose moderation check never got a real answer ("error" — capture failed, the request
+  // failed, or the whole pass never got to it — see runOpenAIModerationPass) is kept rather
+  // than dropped: we don't know whether it's nudity or not, so hiding it would be an
+  // unreviewed false negative, not a confirmed-safe exclusion. Deliberately NOT applied by
+  // currentFilteredTimecodesSegments (download/ASS export) — those should keep exporting
   // everything the local scan found regardless of what this review-time toggle is set to,
   // same principle as REPORT_FLOOR/excludeUncheckedSnapshots' own scoping.
   function filterByModeration(segments) {
     if (!activeVideo || !activeVideo.moderationUsed || !els.moderationFilterInput.checked) return segments;
     return segments.filter((seg) => {
       const peak = typeof seg.peakTime === "number" ? seg.peakTime : seg.start;
-      return activeVideo.moderationVerdicts.get(roundTime(peak)) === "confirmed";
+      const verdict = activeVideo.moderationVerdicts.get(roundTime(peak));
+      return verdict === "confirmed" || verdict === "error";
     });
+  }
+
+  // "Showing N of M results." above the snapshot grid — M is however many segments the
+  // current per-class-sensitivity thresholds detected (activeVideo.liveTimecodesSegments), N
+  // is how many of those survive the "show only confirmed" filter (see filterByModeration).
+  // Only shown at all for videos that ran the OpenAI Moderation pass (same gating as
+  // moderationFilterField itself) — without that pass nothing here can ever differ from M of
+  // M. Called from renderTimecodesDialogContent (so it updates on every single
+  // class-threshold slider tick, not just the debounced thumbnail re-render — see
+  // scheduleSnapshotGridRender's own comment for why that one IS debounced) and from the
+  // confirm-only checkbox's own change handler (which doesn't otherwise touch
+  // liveTimecodesSegments, so wouldn't trigger a recount on its own).
+  function updateSnapshotGridCountHint() {
+    if (!activeVideo || !activeVideo.moderationUsed) {
+      els.snapshotGridCountHint.classList.add("hidden");
+      return;
+    }
+    els.snapshotGridCountHint.classList.remove("hidden");
+    const total = (activeVideo.liveTimecodesSegments || []).length;
+    const shown = filterByModeration(activeVideo.liveTimecodesSegments || []).length;
+    els.snapshotGridCountHint.textContent = VMI18n.t("timecodesDialog.snapshotGridCountHint", { shown, total, count: total });
   }
 
   // Renders the plain-text list from activeVideo.liveTimecodesSegments, filtered by the
@@ -1011,36 +1039,58 @@
   // gated by settings.openaiModerationEnabled + a configured relay endpoint (see js/openai-
   // moderation.js — the relay itself supplies the API key by default; openaiApiKey is only
   // sent when useOwnOpenAIApiKey opts into overriding that). Runs strictly sequentially — one
-  // capture-then-check per scene, not
-  // pooled/concurrent — both to keep this simple and to stay well clear of whatever rate
-  // limit the user's own key is subject to; a scan with many detected scenes will take a
-  // while here, hence the "Confirming N/M with OpenAI…" status text. Returns a
-  // Map<roundedPeakTime, "confirmed"|"rejected"> — a scene whose capture or API call failed
-  // just has no entry (its verdict stays unset) rather than aborting the whole pass, since
-  // the local scan itself already succeeded and shouldn't be undone by this optional
-  // secondary check failing on one frame.
+  // capture-then-check per scene, not pooled/concurrent — both to keep this simple and to
+  // stay well clear of whatever rate limit the user's own key is subject to; a scan with many
+  // detected scenes will take a while here, hence the "Confirming N/M with OpenAI…" status
+  // text. Returns a Map<roundedPeakTime, "confirmed"|"rejected"|"error"> covering every
+  // requested segment — "error" means the check never got a real answer (frame capture
+  // failed, the API request itself failed, or cancellation cut the pass short before this
+  // segment's turn), NOT that it was cleared; see filterByModeration, which deliberately
+  // keeps "error" segments visible rather than hiding them like a "rejected" one, since we
+  // don't actually know whether they're nudity or not. A failure here — total or partial —
+  // never aborts the pass or discards the local scan's own results.
   async function runOpenAIModerationPass(file, segments, token) {
     const verdicts = new Map();
     if (!segments.length) return verdicts;
 
     const items = segments.map((seg) => ({ time: typeof seg.peakTime === "number" ? seg.peakTime : seg.start }));
     els.scanStatusText.textContent = VMI18n.t("scan.statusModerationCapturing");
-    const dataUrls = await VMSnapshots.captureFullFrameBatch(file, items);
+
+    let dataUrls;
+    try {
+      dataUrls = await VMSnapshots.captureFullFrameBatch(file, items);
+    } catch (err) {
+      console.warn("OpenAI Moderation pass: capturing frames failed; leaving every scene unconfirmed instead of hiding it.", err);
+      dataUrls = [];
+    }
+
     const endpoint = getModerationEndpoint();
 
     for (let i = 0; i < segments.length; i++) {
       if (token && token.cancelled) break;
+      const key = roundTime(items[i].time);
       const dataUrl = dataUrls[i];
-      if (!dataUrl) continue;
+      if (!dataUrl) {
+        verdicts.set(key, "error");
+        continue;
+      }
       els.scanStatusText.textContent = VMI18n.t("scan.statusModerationChecking", { current: i + 1, count: segments.length });
       try {
         const ownApiKey = settings.useOwnOpenAIApiKey ? settings.openaiApiKey : undefined;
         const result = await VMOpenAIModeration.checkImage(ownApiKey, dataUrl, endpoint);
-        verdicts.set(roundTime(items[i].time), result.flagged ? "confirmed" : "rejected");
+        verdicts.set(key, result.flagged ? "confirmed" : "rejected");
       } catch (err) {
-        console.warn("OpenAI Moderation check failed for one scene.", err);
+        console.warn("OpenAI Moderation check failed for one scene; showing it unconfirmed instead of hiding it.", err);
+        verdicts.set(key, "error");
       }
     }
+    // Cancellation can break out of the loop above before reaching every segment — anything
+    // still missing a verdict at that point was simply never checked, which is the same
+    // "we don't know" situation as any other failure, so it gets the same "error" treatment.
+    items.forEach((item) => {
+      const key = roundTime(item.time);
+      if (!verdicts.has(key)) verdicts.set(key, "error");
+    });
     return verdicts;
   }
 
@@ -1292,7 +1342,8 @@
       // OpenAI Moderation API verdicts from this video's scan (see runOpenAIModerationPass),
       // keyed the same way as excludedSnapshotTimes above (roundTime of a segment's
       // peakTime) since segments have no other stable identity across re-merges. Values are
-      // "confirmed" (API agreed it's nudity) or "rejected" (API says it isn't).
+      // "confirmed" (API agreed it's nudity), "rejected" (API says it isn't), or "error"
+      // (the check never got a real answer — see runOpenAIModerationPass).
       // moderationUsed records whether the scan that produced this record actually ran the
       // pass at all — the Timecodes dialog's filter checkbox only appears when it did.
       // record.moderationVerdicts is normally an array of [time, verdict] pairs (see
